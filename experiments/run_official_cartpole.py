@@ -14,9 +14,9 @@ from benchmarks.cartpole_twin.env import CartPoleEnvConfig, CartPolePhysicalEnv
 from benchmarks.cartpole_twin.regimes import CartPoleRegimeConfig, generate_theta_path
 from benchmarks.cartpole_twin.rollout import run_cartpole_rollout
 from benchmarks.scalar_dual.filters import GaussianBelief
+from controllers.kh_gp import KHGPConfig, KHGPControllerCartPole
 from controllers.official import (
     ArcariDualSMPCCartPole,
-    KHDualControlCartPole,
     OfficialCartPoleConfig,
     OracleTrendCartPole,
     TVGPLCBCartPole,
@@ -33,12 +33,12 @@ def make_regime(kind: str, horizon: int) -> CartPoleRegimeConfig:
     raise ValueError(kind)
 
 
-def build_controllers(theta_path: np.ndarray, dynamics: CartPoleParams, cost: CartPoleCost, config: OfficialCartPoleConfig, seed: int):
+def build_controllers(theta_path: np.ndarray, noise_path: np.ndarray, dynamics: CartPoleParams, cost: CartPoleCost, config: OfficialCartPoleConfig, kh_config: KHGPConfig, seed: int):
     return [
-        KHDualControlCartPole(GaussianBelief(mean=1.0, var=0.1), dynamics, cost, config),
+        KHGPControllerCartPole(dynamics, cost, kh_config),
         ArcariDualSMPCCartPole(GaussianBelief(mean=1.0, var=0.1), dynamics, cost, config, seed=seed),
         TVGPLCBCartPole(dynamics, cost, config),
-        OracleTrendCartPole(theta_path, dynamics, cost, config),
+        OracleTrendCartPole(theta_path, dynamics, cost, config, noise_path=noise_path),
     ]
 
 
@@ -61,13 +61,20 @@ def run_one_setting(args: argparse.Namespace, twin_gap: str, regime_kind: str) -
         smpc_dual_horizon=args.smpc_dual_horizon,
         smpc_scenarios=args.smpc_scenarios,
     )
+    kh_config = KHGPConfig(
+        horizon=args.planning_horizon,
+        action_grid_size=args.action_grid_size,
+        num_features=args.kh_gp_features,
+        lengthscale=args.kh_gp_lengthscale,
+        seed=0,
+    )
     regime = make_regime(regime_kind, args.horizon)
     for seed in range(args.seed, args.seed + args.n_seeds):
         rng = np.random.default_rng(seed)
         theta_path = generate_theta_path(regime, rng)
         process_std = np.array(CartPoleEnvConfig().process_std)
         process_noise = rng.normal(0.0, process_std, size=(args.horizon, 4))
-        controllers = build_controllers(theta_path, dynamics if twin_gap == "gap" else nominal_dynamics, cost, config, seed)
+        controllers = build_controllers(theta_path, process_noise, dynamics if twin_gap == "gap" else nominal_dynamics, cost, config, kh_config, seed)
         for controller in controllers:
             if controller.name != "oracle_trend":
                 if hasattr(controller, "dynamics"):
@@ -145,6 +152,8 @@ def main() -> None:
     parser.add_argument("--observation-interval", type=int, default=1)
     parser.add_argument("--nonsmooth-switch-cost", type=float, default=0.0)
     parser.add_argument("--nonsmooth-switch-threshold", type=float, default=1e-9)
+    parser.add_argument("--kh-gp-features", type=int, default=16)
+    parser.add_argument("--kh-gp-lengthscale", type=float, default=1.0)
     parser.add_argument("--gap-lag-alpha", type=float, default=0.6)
     parser.add_argument("--gap-friction", type=float, default=0.02)
     parser.add_argument("--out-dir", type=Path, default=Path("reports/tables/official"))

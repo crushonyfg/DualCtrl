@@ -6,7 +6,7 @@ controllers in other files are intentionally excluded from official tables.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from numpy.polynomial.hermite import hermgauss
@@ -15,11 +15,17 @@ from benchmarks.cartpole_twin.costs import CartPoleCost
 from benchmarks.cartpole_twin.dynamics import CartPoleParams, cartpole_step, reference_position
 from benchmarks.scalar_dual.costs import ScalarCost
 from benchmarks.scalar_dual.filters import GaussianBelief
+from controllers.kh_gp import KHGPConfig, KHGPControllerCartPole
+from controllers.kh_strict import KHScalarADConfig, KHScalarADController
+from controllers.tv_gp_ucb import TVGPUCBConfig, RealizedCostBanditAdapter
 
 
 @dataclass(frozen=True)
 class OfficialScalarConfig:
     horizon: int = 3
+    # Finite-action benchmark assumption: Arcari et al.'s continuous NLP in
+    # Eq. (10) is solved exactly over this explicit finite grid, while keeping
+    # the same scenario-tree objective over all node actions.
     action_low: float = -3.0
     action_high: float = 3.0
     action_grid_size: int = 31
@@ -40,6 +46,7 @@ class OfficialScalarConfig:
 @dataclass(frozen=True)
 class OfficialCartPoleConfig:
     horizon: int = 8
+    # Finite-action benchmark assumption; see OfficialScalarConfig.
     action_grid_size: int = 9
     theta_process_var: float = 1e-4
     theta_obs_var: float = 0.02
@@ -57,38 +64,22 @@ class OfficialCartPoleConfig:
         return np.linspace(-1.0, 1.0, self.action_grid_size)
 
 
-class KHDualControlScalar:
-    """Klenske-Hennig style approximate dual control for scalar dynamics.
-
-    Uses the paper's core augmented-belief mechanism for linear-in-parameter
-    Gaussian dynamics: root actions are evaluated by propagating fantasy
-    observations, updating the Gaussian posterior, and valuing the resulting
-    future control problem. The scalar digital twin is x' = x + b u.
-    """
+class KHDualControlScalar(KHScalarADController):
+    """Strict Klenske-Hennig scalar AD baseline routed through kh_strict.py."""
 
     name = "kh_dual_control"
 
     def __init__(self, belief: GaussianBelief, cost: ScalarCost, config: OfficialScalarConfig):
-        self.belief = belief
-        self.cost = cost
-        self.config = config
-
-    @property
-    def belief_mean(self) -> float:
-        return self.belief.mean
-
-    @property
-    def belief_var(self) -> float:
-        return self.belief.var
-
-    def predict(self) -> None:
-        self.belief.predict()
-
-    def observe(self, x: float, u: float, observed_next_x: float, obs_var: float) -> None:
-        self.belief.update(x, u, observed_next_x, obs_var)
-
-    def act(self, x: float, prev_u: float) -> float:
-        return _kh_scalar_action(x, prev_u, self.belief, self.cost, self.config)
+        kh_config = KHScalarADConfig(
+            a=1.0,
+            process_var=config.process_var,
+            obs_var=0.0,
+            horizon=config.horizon,
+            action_low=config.action_low,
+            action_high=config.action_high,
+            action_grid_size=config.action_grid_size,
+        )
+        super().__init__(belief, cost, kh_config)
 
 
 class ArcariDualSMPCScalar:
@@ -125,9 +116,19 @@ class ArcariDualSMPCScalar:
     def act(self, x: float, prev_u: float) -> float:
         return _arcari_scalar_action(x, prev_u, self.belief, self.cost, self.config, self.rng)
 
+    def build_tree_for_action(self, x: float, prev_u: float, root_action: float) -> ArcariScalarScenarioTree:
+        """Expose the explicit Eq. (5)-(10) tree for tests and diagnostics."""
+        return build_arcari_scalar_scenario_tree(x, prev_u, root_action, self.belief, self.cost, self.config)
+
 
 class TVGPLCBScalar:
-    """Bogunovic et al. TV-GP-UCB adapted as LCB for cost minimization."""
+    """Strict Bogunovic et al. finite-action TV-GP-LCB for realized costs.
+
+    Each feasible root action in the current scalar context is a bandit arm with
+    feature [x, previous_action, action]. The update uses only the realized stage
+    cost supplied after the environment step; no nominal dynamics or terminal-cost
+    heuristic is added to the acquisition.
+    """
 
     name = "tv_gp_lcb"
 
@@ -135,12 +136,20 @@ class TVGPLCBScalar:
         self.cost = cost
         self.config = config
         self.t = 1
-        self.features: list[np.ndarray] = []
-        self.times: list[int] = []
-        self.values: list[float] = []
-        self._last_feature: np.ndarray | None = None
+        self._last_x = 0.0
+        self._last_u = 0.0
         self._last_prev_u = 0.0
-        self._last_nominal_cost = 0.0
+        self._pending_cost = False
+        self.adapter = RealizedCostBanditAdapter(
+            action_provider=lambda _context: [float(u) for u in self.config.action_grid],
+            feature_map=lambda context, action: np.array([float(context[0]), float(context[1]), float(action)], dtype=float),
+            config=TVGPUCBConfig(
+                epsilon=self.config.tvgp_epsilon,
+                noise_var=self.config.tvgp_noise_var,
+                delta=self.config.tvgp_delta,
+                lengthscale=self.config.tvgp_lengthscale,
+            ),
+        )
 
     @property
     def belief_mean(self) -> float:
@@ -154,48 +163,51 @@ class TVGPLCBScalar:
         pass
 
     def observe(self, x: float, u: float, observed_next_x: float, obs_var: float) -> None:
-        if self._last_feature is not None:
-            realized = self.cost.stage(x, u, self._last_prev_u).total
-            self.features.append(self._last_feature)
-            self.times.append(self.t)
-            self.values.append(realized)
-        self.t += 1
+        self._finalize_pending_realized_cost()
+
+    def _finalize_pending_realized_cost(self) -> None:
+        if not self._pending_cost:
+            return
+        realized = self.cost.stage(self._last_x, self._last_u, self._last_prev_u).total
+        self.adapter.update(realized)
+        self.t = self.adapter.t
+        self._pending_cost = False
 
     def record_cost(self, feature: np.ndarray, stage_cost: float) -> None:
-        self.features.append(feature)
-        self.times.append(self.t)
-        self.values.append(stage_cost)
-        self.t += 1
+        context = (float(feature[0]), float(feature[1]))
+        action = float(feature[2])
+        self.adapter.update(float(stage_cost), action=action, context=context)
+        self.t = self.adapter.t
 
     def act(self, x: float, prev_u: float) -> float:
-        best_u = 0.0
-        best_lcb = float("inf")
-        beta = 2.0 * np.log((len(self.config.action_grid) * np.pi**2 * max(self.t, 1) ** 2) / (6.0 * self.config.tvgp_delta))
-        for u in self.config.action_grid:
-            u = float(u)
-            feature = np.array([x, prev_u, u], dtype=float)
-            mu, var = _tv_gp_posterior(feature, self.t, self.features, self.times, self.values, self.config)
-            nominal = self.cost.stage(x, u, prev_u).total
-            lcb = mu - np.sqrt(beta) * np.sqrt(max(var, 0.0))
-            if lcb < best_lcb:
-                best_lcb = lcb
-                best_u = u
-                self._last_feature = feature
-                self._last_prev_u = prev_u
-                self._last_nominal_cost = nominal
-        return best_u
+        self._finalize_pending_realized_cost()
+        u = float(self.adapter.select((float(x), float(prev_u))))
+        self._last_x = float(x)
+        self._last_u = u
+        self._last_prev_u = float(prev_u)
+        self._pending_cost = True
+        self.t = self.adapter.t
+        return u
 
 
 class OracleTrendScalar:
-    """Oracle MPC knowing current/future theta trend and true physical gap."""
+    """Pathwise oracle knowing future theta, physical gap, and realized noise."""
 
     name = "oracle_trend"
 
-    def __init__(self, b_path: np.ndarray, cost: ScalarCost, config: OfficialScalarConfig, discrepancy_quadratic: float = 0.0):
+    def __init__(
+        self,
+        b_path: np.ndarray,
+        cost: ScalarCost,
+        config: OfficialScalarConfig,
+        discrepancy_quadratic: float = 0.0,
+        noise_path: np.ndarray | None = None,
+    ):
         self.b_path = b_path
         self.cost = cost
         self.config = config
         self.discrepancy_quadratic = discrepancy_quadratic
+        self.noise_path = np.zeros_like(b_path) if noise_path is None else np.asarray(noise_path, dtype=float)
         self.t = 0
 
     @property
@@ -214,37 +226,23 @@ class OracleTrendScalar:
 
     def act(self, x: float, prev_u: float) -> float:
         horizon_b = self.b_path[self.t : min(len(self.b_path), self.t + self.config.horizon)]
-        return _oracle_scalar_action(x, prev_u, horizon_b, self.cost, self.config, self.discrepancy_quadratic)
+        horizon_noise = self.noise_path[self.t : min(len(self.noise_path), self.t + self.config.horizon)]
+        return _oracle_scalar_action(x, prev_u, horizon_b, horizon_noise, self.cost, self.config, self.discrepancy_quadratic)
 
 
-class KHDualControlCartPole:
-    name = "kh_dual_control"
+class KHDualControlCartPole(KHGPControllerCartPole):
+    """Official CartPole KH baseline: finite-feature GP AD, not theta pseudo-observation."""
 
     def __init__(self, belief: GaussianBelief, dynamics: CartPoleParams, cost: CartPoleCost, config: OfficialCartPoleConfig):
-        self.belief = belief
-        self.dynamics = dynamics
-        self.cost = cost
-        self.config = config
-        self.t = 0
-
-    @property
-    def belief_mean(self) -> float:
-        return self.belief.mean
-
-    @property
-    def belief_var(self) -> float:
-        return self.belief.var
-
-    def predict(self) -> None:
-        self.belief.predict()
-
-    def observe(self, state: np.ndarray, action: float, next_state: np.ndarray) -> None:
-        theta_hat = _cartpole_theta_pseudo_observation(state, action, next_state, self.dynamics)
-        self.belief.update(0.0, 1.0, theta_hat, self.config.theta_obs_var)
-        self.t += 1
-
-    def act(self, state: np.ndarray, prev_action: float) -> float:
-        return _kh_cartpole_action(state, prev_action, self.t, self.belief, self.dynamics, self.cost, self.config)
+        del belief
+        kh_config = KHGPConfig(
+            horizon=config.horizon,
+            action_grid_size=config.action_grid_size,
+            lengthscale=config.tvgp_lengthscale,
+            gp_noise_var=config.tvgp_noise_var,
+        )
+        super().__init__(dynamics, cost, kh_config)
+        self.official_config = config
 
 
 class ArcariDualSMPCCartPole:
@@ -277,8 +275,114 @@ class ArcariDualSMPCCartPole:
     def act(self, state: np.ndarray, prev_action: float) -> float:
         return _arcari_cartpole_action(state, prev_action, self.t, self.belief, self.dynamics, self.cost, self.config, self.rng)
 
+    def build_tree_for_action(self, state: np.ndarray, prev_action: float, root_action: float) -> "ArcariCartPoleScenarioTree":
+        """Expose the explicit Eq. (5)-(10) CartPole tree for tests and diagnostics."""
+        return build_arcari_cartpole_scenario_tree(state, prev_action, self.t, root_action, self.belief, self.dynamics, self.cost, self.config)
+
+
+@dataclass
+class ArcariScalarTreeNode:
+    """One information-state node in Arcari et al.'s dual scenario tree."""
+
+    node_id: int
+    depth: int
+    parent_id: int | None
+    branch_index: int
+    mode_index: int
+    sample_index: int
+    probability: float
+    state: float
+    prev_action: float
+    belief: GaussianBelief
+    mode_probability: float = 1.0
+    parameter_sample: float | None = None
+    noise_sample: float | None = None
+    action: float | None = None
+    stage_cost: float | None = None
+    children: list[int] = field(default_factory=list)
+
+
+@dataclass
+class ArcariScalarScenarioTree:
+    """Explicit tree and unified objective for Eqs. (5)-(10), nm=1."""
+
+    nodes: list[ArcariScalarTreeNode]
+    levels: list[list[int]]
+    dual_cost: float
+    exploitation_cost: float
+    total_cost: float
+    root_action: float
+    dual_horizon: int
+    prediction_horizon: int
+    branch_factor: int
+
+    def node_count_by_depth(self) -> list[int]:
+        return [len(level) for level in self.levels]
+
+
+@dataclass
+class ArcariCartPoleTreeNode:
+    """One CartPole information-state node in Arcari et al.'s scenario tree.
+
+    The node stores the physical state, parent/child topology, recursive Eq. (7)
+    probability weight, and the branch-specific posterior information state used
+    to choose subsequent dual actions and the fixed-information exploitation tail.
+    ``transition_stage_cost`` is the cost of the parent action on the sampled
+    transition that created this node.
+    """
+
+    node_id: int
+    depth: int
+    parent_id: int | None
+    branch_index: int
+    mode_index: int
+    sample_index: int
+    probability: float
+    state: np.ndarray
+    prev_action: float
+    time: int
+    belief: GaussianBelief
+    branch_weight: float = 1.0
+    mode_probability: float = 1.0
+    parameter_sample: float | None = None
+    process_noise_sample: np.ndarray | None = None
+    action: float | None = None
+    transition_stage_cost: float | None = None
+    failed: bool = False
+    children: list[int] = field(default_factory=list)
+
+    @property
+    def information_state(self) -> GaussianBelief:
+        return self.belief
+
+
+@dataclass
+class ArcariCartPoleScenarioTree:
+    """Explicit CartPole scenario tree and Eq. (10) objective decomposition."""
+
+    nodes: list[ArcariCartPoleTreeNode]
+    levels: list[list[int]]
+    dual_cost: float
+    exploitation_cost: float
+    total_cost: float
+    root_action: float
+    dual_horizon: int
+    prediction_horizon: int
+    branch_factor: int
+
+    def node_count_by_depth(self) -> list[int]:
+        return [len(level) for level in self.levels]
+
 
 class TVGPLCBCartPole:
+    """Strict Bogunovic et al. finite-action TV-GP-LCB for CartPole costs.
+
+    Each feasible root action in the current state/context is a bandit arm with
+    feature concat(state, previous_action, action). The update uses only the
+    realized stage cost after the environment step; no nominal CartPole rollout,
+    terminal cost, or model-predicted failure heuristic enters the acquisition.
+    """
+
     name = "tv_gp_lcb"
 
     def __init__(self, dynamics: CartPoleParams, cost: CartPoleCost, config: OfficialCartPoleConfig):
@@ -286,12 +390,21 @@ class TVGPLCBCartPole:
         self.cost = cost
         self.config = config
         self.t = 1
-        self.features: list[np.ndarray] = []
-        self.times: list[int] = []
-        self.values: list[float] = []
-        self._last_feature: np.ndarray | None = None
+        self._last_state = np.zeros(4, dtype=float)
+        self._last_action = 0.0
         self._last_prev_action = 0.0
-        self._last_nominal_cost = 0.0
+        self._last_failed = False
+        self._pending_cost = False
+        self.adapter = RealizedCostBanditAdapter(
+            action_provider=lambda _context: [float(u) for u in self.config.action_grid],
+            feature_map=lambda context, action: np.concatenate([np.asarray(context[0], dtype=float), np.array([float(context[1]), float(action)])]),
+            config=TVGPUCBConfig(
+                epsilon=self.config.tvgp_epsilon,
+                noise_var=self.config.tvgp_noise_var,
+                delta=self.config.tvgp_delta,
+                lengthscale=self.config.tvgp_lengthscale,
+            ),
+        )
 
     @property
     def belief_mean(self) -> float:
@@ -305,43 +418,47 @@ class TVGPLCBCartPole:
         pass
 
     def observe(self, state: np.ndarray, action: float, next_state: np.ndarray) -> None:
-        if self._last_feature is not None:
-            failed = self.cost.failed(next_state)
-            value = self.cost.stage(state, action, self._last_prev_action, reference_position(self.t - 1), failed).total
-            self.features.append(self._last_feature)
-            self.times.append(self.t)
-            self.values.append(value)
-        self.t += 1
+        self._last_failed = self.cost.failed(next_state)
+        self._finalize_pending_realized_cost()
+
+    def _finalize_pending_realized_cost(self) -> None:
+        if not self._pending_cost:
+            return
+        value = self.cost.stage(self._last_state, self._last_action, self._last_prev_action, reference_position(self.t - 1), self._last_failed).total
+        self.adapter.update(value)
+        self.t = self.adapter.t
+        self._pending_cost = False
+        self._last_failed = False
 
     def act(self, state: np.ndarray, prev_action: float) -> float:
-        best_u = 0.0
-        best_lcb = float("inf")
-        beta = 2.0 * np.log((len(self.config.action_grid) * np.pi**2 * max(self.t, 1) ** 2) / (6.0 * self.config.tvgp_delta))
-        for u in self.config.action_grid:
-            u = float(u)
-            feature = np.concatenate([state, np.array([prev_action, u])])
-            mu, var = _tv_gp_posterior_cartpole(feature, self.t, self.features, self.times, self.values, self.config)
-            pred, _ = cartpole_step(state, u, 1.0, self.dynamics)
-            failed = self.cost.failed(pred)
-            nominal = self.cost.stage(state, u, prev_action, reference_position(self.t - 1), failed).total + self.cost.terminal(pred, reference_position(self.t)).total
-            lcb = mu - np.sqrt(beta) * np.sqrt(max(var, 0.0))
-            if lcb < best_lcb:
-                best_lcb = lcb
-                best_u = u
-                self._last_feature = feature
-                self._last_prev_action = prev_action
-                self._last_nominal_cost = nominal
-        return best_u
+        if self._pending_cost:
+            self._last_failed = self.cost.failed(np.asarray(state, dtype=float))
+        self._finalize_pending_realized_cost()
+        action = float(self.adapter.select((np.asarray(state, dtype=float).copy(), float(prev_action))))
+        self._last_state = np.asarray(state, dtype=float).copy()
+        self._last_action = action
+        self._last_prev_action = float(prev_action)
+        self._pending_cost = True
+        self.t = self.adapter.t
+        return action
 
 
 class OracleTrendCartPole:
     name = "oracle_trend"
 
-    def __init__(self, theta_path: np.ndarray, dynamics: CartPoleParams, cost: CartPoleCost, config: OfficialCartPoleConfig):
+    def __init__(
+        self,
+        theta_path: np.ndarray,
+        dynamics: CartPoleParams,
+        cost: CartPoleCost,
+        config: OfficialCartPoleConfig,
+        noise_path: np.ndarray | None = None,
+    ):
         self.theta_path = theta_path
         self.dynamics = dynamics
         self.cost = cost
         self.config = config
+        self.noise_path = np.zeros((len(theta_path), 4), dtype=float) if noise_path is None else np.asarray(noise_path, dtype=float)
         self.t = 0
 
     @property
@@ -359,7 +476,7 @@ class OracleTrendCartPole:
         self.t += 1
 
     def act(self, state: np.ndarray, prev_action: float) -> float:
-        return _oracle_cartpole_action(state, prev_action, self.t, self.theta_path, self.dynamics, self.cost, self.config)
+        return _oracle_cartpole_action(state, prev_action, self.t, self.theta_path, self.noise_path, self.dynamics, self.cost, self.config)
 
 
 def _kh_scalar_action(x: float, prev_u: float, belief: GaussianBelief, cost: ScalarCost, config: OfficialScalarConfig) -> float:
@@ -386,21 +503,161 @@ def _kh_scalar_action(x: float, prev_u: float, belief: GaussianBelief, cost: Sca
 def _arcari_scalar_action(x: float, prev_u: float, belief: GaussianBelief, cost: ScalarCost, config: OfficialScalarConfig, rng: np.random.Generator) -> float:
     """Root action for Arcari et al. explicit dual/exploitation tree.
 
-    For the no-structural-mode case, n_m=1. The first L stages form the
-    dual scenario tree. Each node chooses its own action; each action branches
-    into parameter/noise scenarios and updates the node information state. At
-    depth L, the branch belief is fixed and an exploitation tail is solved.
+    For the no-structural-mode case, n_m=1. We make the benchmark's finite
+    action grid explicit and minimize the paper's unified Eq. (10) objective
+    over all node actions in the sampled dual tree plus branch-wise exploitation
+    tails, rather than using a one-step lookahead surrogate.
+    """
+    best_u, best_value = 0.0, float("inf")
+    for u in config.action_grid:
+        tree = build_arcari_scalar_scenario_tree(x, prev_u, float(u), belief, cost, config)
+        if tree.total_cost < best_value:
+            best_value = tree.total_cost
+            best_u = float(u)
+    return best_u
+
+
+def build_arcari_scalar_scenario_tree(
+    x: float,
+    prev_u: float,
+    root_action: float,
+    belief: GaussianBelief,
+    cost: ScalarCost,
+    config: OfficialScalarConfig,
+) -> ArcariScalarScenarioTree:
+    """Build and optimize Arcari et al.'s scalar scenario tree (Eqs. 5-10).
+
+    The paper samples parameters and noise at every dual node (Eq. 5), updates
+    the information state of each child node via Bayes' rule (Eq. 4, used by
+    GaussianBelief.update), assigns recursive node probabilities/weights
+    (Eq. 7; nm=1 here, so mode probability is one), and then merges the dual
+    and exploitation parts into one objective over all tree-node actions
+    (Eqs. 6 and 10). This finite-action benchmark enumerates all actions on the
+    configured grid instead of calling a continuous nonlinear optimizer.
     """
     dual_horizon = min(config.smpc_dual_horizon, config.horizon)
+    root_parameter_scenarios = _sigma_scenarios(belief.mean, belief.var, config.smpc_scenarios)
+    noise_nodes, noise_weights = _normal_sigma(config.process_var)
+    branch_factor = len(root_parameter_scenarios) * len(noise_nodes)
+
+    root = ArcariScalarTreeNode(
+        node_id=0,
+        depth=0,
+        parent_id=None,
+        branch_index=0,
+        mode_index=0,
+        sample_index=0,
+        probability=1.0,
+        state=float(x),
+        prev_action=float(prev_u),
+        belief=belief.copy(),
+    )
+    nodes = [root]
+    levels: list[list[int]] = [[0]]
+    next_id = 1
+
+    for depth in range(dual_horizon):
+        next_level: list[int] = []
+        for node_id in levels[depth]:
+            node = nodes[node_id]
+            if depth == 0:
+                action = float(root_action)
+                value_to_go = None
+            else:
+                action, value_to_go = _arcari_scalar_best_dual_action_for_node(
+                    node.state,
+                    node.prev_action,
+                    node.belief,
+                    cost,
+                    config,
+                    depth,
+                    dual_horizon,
+                )
+            node.action = action
+            node.stage_cost = cost.stage(node.state, action, node.prev_action).total
+
+            parameter_scenarios = _sigma_scenarios(node.belief.mean, node.belief.var, config.smpc_scenarios)
+            for sample_index, ((theta, theta_weight), (noise, noise_weight)) in enumerate(
+                (param_noise for param_noise in ((ps, nw) for ps in parameter_scenarios for nw in zip(noise_nodes, noise_weights)))
+            ):
+                child_belief = node.belief.copy()
+                child_state = float(node.state + theta * action + float(noise))
+                child_belief.update(node.state, action, child_state, config.process_var)
+                child_weight = float(theta_weight * noise_weight)
+                child = ArcariScalarTreeNode(
+                    node_id=next_id,
+                    depth=depth + 1,
+                    parent_id=node_id,
+                    branch_index=sample_index,
+                    mode_index=0,
+                    sample_index=sample_index,
+                    probability=node.probability * child_weight,
+                    state=child_state,
+                    prev_action=action,
+                    belief=child_belief,
+                    mode_probability=1.0,
+                    parameter_sample=float(theta),
+                    noise_sample=float(noise),
+                )
+                nodes.append(child)
+                node.children.append(next_id)
+                next_level.append(next_id)
+                next_id += 1
+        levels.append(next_level)
+
+    dual_cost = 0.0
+    for depth in range(dual_horizon):
+        for node_id in levels[depth]:
+            node = nodes[node_id]
+            if node.stage_cost is None:
+                raise RuntimeError("dual node was not assigned an action")
+            dual_cost += node.probability * node.stage_cost
+    exploitation_cost = 0.0
+    for leaf_id in levels[dual_horizon]:
+        leaf = nodes[leaf_id]
+        tail = _scalar_exploitation_value(
+            leaf.state,
+            leaf.prev_action,
+            leaf.belief.mean,
+            leaf.belief.var,
+            cost,
+            config,
+            config.horizon - dual_horizon,
+        )
+        exploitation_cost += leaf.probability * tail
+
+    return ArcariScalarScenarioTree(
+        nodes=nodes,
+        levels=levels,
+        dual_cost=float(dual_cost),
+        exploitation_cost=float(exploitation_cost),
+        total_cost=float(dual_cost + exploitation_cost),
+        root_action=float(root_action),
+        dual_horizon=dual_horizon,
+        prediction_horizon=config.horizon,
+        branch_factor=branch_factor,
+    )
+
+
+def _arcari_scalar_best_dual_action_for_node(
+    x: float,
+    prev_u: float,
+    belief: GaussianBelief,
+    cost: ScalarCost,
+    config: OfficialScalarConfig,
+    depth: int,
+    dual_horizon: int,
+) -> tuple[float, float]:
+    """Return the optimal finite-grid action for a non-root dual tree node."""
     best_u, best_value = 0.0, float("inf")
     for u in config.action_grid:
         u = float(u)
         value = cost.stage(x, u, prev_u).total
-        value += _arcari_scalar_child_expectation(x, u, belief, cost, config, depth=1, dual_horizon=dual_horizon)
+        value += _arcari_scalar_child_expectation(x, u, belief, cost, config, depth + 1, dual_horizon)
         if value < best_value:
             best_value = value
             best_u = u
-    return best_u
+    return best_u, float(best_value)
 
 
 def _arcari_scalar_node_value(
@@ -414,14 +671,8 @@ def _arcari_scalar_node_value(
 ) -> float:
     if depth >= dual_horizon:
         return _scalar_exploitation_value(x, prev_u, belief.mean, belief.var, cost, config, config.horizon - depth)
-    best = float("inf")
-    for u in config.action_grid:
-        u = float(u)
-        value = cost.stage(x, u, prev_u).total
-        value += _arcari_scalar_child_expectation(x, u, belief, cost, config, depth + 1, dual_horizon)
-        if value < best:
-            best = value
-    return best
+    _, best_value = _arcari_scalar_best_dual_action_for_node(x, prev_u, belief, cost, config, depth, dual_horizon)
+    return best_value
 
 
 def _arcari_scalar_child_expectation(
@@ -462,25 +713,25 @@ def _scalar_exploitation_value(x: float, prev_u: float, mean: float, var: float,
     return best
 
 
-def _oracle_scalar_action(x: float, prev_u: float, b_future: np.ndarray, cost: ScalarCost, config: OfficialScalarConfig, discrepancy_quadratic: float = 0.0) -> float:
+def _oracle_scalar_action(x: float, prev_u: float, b_future: np.ndarray, noise_future: np.ndarray, cost: ScalarCost, config: OfficialScalarConfig, discrepancy_quadratic: float = 0.0) -> float:
     best_u, best_value = 0.0, float("inf")
     for u in config.action_grid:
         u = float(u)
         value = cost.stage(x, u, prev_u).total
-        value += _oracle_scalar_value(x + b_future[0] * u + discrepancy_quadratic * u * u, u, b_future[1:], cost, config, discrepancy_quadratic)
+        value += _oracle_scalar_value(x + b_future[0] * u + discrepancy_quadratic * u * u + noise_future[0], u, b_future[1:], noise_future[1:], cost, config, discrepancy_quadratic)
         if value < best_value:
             best_value = value
             best_u = float(u)
     return best_u
 
 
-def _oracle_scalar_value(x: float, prev_u: float, b_future: np.ndarray, cost: ScalarCost, config: OfficialScalarConfig, discrepancy_quadratic: float = 0.0) -> float:
+def _oracle_scalar_value(x: float, prev_u: float, b_future: np.ndarray, noise_future: np.ndarray, cost: ScalarCost, config: OfficialScalarConfig, discrepancy_quadratic: float = 0.0) -> float:
     if len(b_future) == 0:
         return cost.terminal(x).total
     best = float("inf")
     for u in config.action_grid:
         u = float(u)
-        value = cost.stage(x, u, prev_u).total + _oracle_scalar_value(x + b_future[0] * u + discrepancy_quadratic * u * u, u, b_future[1:], cost, config, discrepancy_quadratic)
+        value = cost.stage(x, u, prev_u).total + _oracle_scalar_value(x + b_future[0] * u + discrepancy_quadratic * u * u + noise_future[0], u, b_future[1:], noise_future[1:], cost, config, discrepancy_quadratic)
         best = min(best, value)
     return best
 
@@ -575,17 +826,168 @@ def _kh_cartpole_action(state: np.ndarray, prev_action: float, t: int, belief: G
 
 
 def _arcari_cartpole_action(state: np.ndarray, prev_action: float, t: int, belief: GaussianBelief, dynamics: CartPoleParams, cost: CartPoleCost, config: OfficialCartPoleConfig, rng: np.random.Generator) -> float:
-    dual_horizon = min(config.smpc_dual_horizon, config.horizon)
+    """Root action for Arcari et al.'s CartPole dual stochastic MPC tree.
+
+    The benchmark solver is finite-action but preserves Eq. (10): every root
+    candidate builds the full sampled dual tree to depth L, optimizes all
+    non-root dual-node actions over the same grid, and appends branch-wise
+    exploitation tails with information fixed at depth L.
+    """
+    del rng  # deterministic sigma-point samples make the benchmark reproducible.
     best_u, best_value = 0.0, float("inf")
     for action in config.action_grid:
+        tree = build_arcari_cartpole_scenario_tree(state, prev_action, t, float(action), belief, dynamics, cost, config)
+        if tree.total_cost < best_value:
+            best_value = tree.total_cost
+            best_u = float(action)
+    return best_u
+
+
+def build_arcari_cartpole_scenario_tree(
+    state: np.ndarray,
+    prev_action: float,
+    t: int,
+    root_action: float,
+    belief: GaussianBelief,
+    dynamics: CartPoleParams,
+    cost: CartPoleCost,
+    config: OfficialCartPoleConfig,
+) -> ArcariCartPoleScenarioTree:
+    """Build and optimize Arcari et al.'s CartPole scenario tree (Eqs. 5-10).
+
+    Eq. (5) is represented by sampled CartPole transitions
+    ``x_child = f(x_parent, u_parent, gamma_sample) + w_sample``.  Eq. (7)
+    probabilities are recursive parent probabilities times parameter/noise sample
+    weights (single structural mode, so mode probability is one).  Each child
+    stores its branch-specific Bayesian information-state update from the sampled
+    observation.  Eq. (10) is stored as ``dual_cost + exploitation_cost``: the
+    dual part sums all sampled transition costs generated by actions on depths
+    ``0..L-1``; exploitation solves each depth-L branch with that leaf posterior
+    fixed for the remaining prediction horizon ``N-L``.
+    """
+    dual_horizon = min(config.smpc_dual_horizon, config.horizon)
+    parameter_scenarios = _sigma_scenarios(belief.mean, belief.var, config.smpc_scenarios)
+    noise_scenarios = _cartpole_noise_scenarios(config)
+    branch_factor = len(parameter_scenarios) * len(noise_scenarios)
+
+    root = ArcariCartPoleTreeNode(
+        node_id=0,
+        depth=0,
+        parent_id=None,
+        branch_index=0,
+        mode_index=0,
+        sample_index=0,
+        probability=1.0,
+        state=np.asarray(state, dtype=float).copy(),
+        prev_action=float(prev_action),
+        time=int(t),
+        belief=belief.copy(),
+    )
+    nodes: list[ArcariCartPoleTreeNode] = [root]
+    levels: list[list[int]] = [[0]]
+    next_id = 1
+
+    for depth in range(dual_horizon):
+        next_level: list[int] = []
+        for node_id in levels[depth]:
+            node = nodes[node_id]
+            if depth == 0:
+                action = float(root_action)
+            else:
+                action, _ = _arcari_cartpole_best_dual_action_for_node(
+                    node.state, node.prev_action, node.time, node.belief, dynamics, cost, config, depth, dual_horizon
+                )
+            node.action = action
+
+            branch_index = 0
+            for theta, theta_weight in _sigma_scenarios(node.belief.mean, node.belief.var, config.smpc_scenarios):
+                nominal_next, _ = cartpole_step(node.state, action, float(theta), dynamics)
+                for noise, noise_weight in _cartpole_noise_scenarios(config):
+                    child_state = np.asarray(nominal_next + noise, dtype=float)
+                    failed = cost.failed(child_state)
+                    stage = cost.stage(node.state, action, node.prev_action, reference_position(node.time), failed).total
+                    child_belief = node.belief.copy()
+                    theta_obs = _cartpole_theta_pseudo_observation(node.state, action, child_state, dynamics)
+                    child_belief.update(0.0, 1.0, theta_obs, config.theta_obs_var)
+                    child_weight = float(theta_weight * noise_weight)
+                    child = ArcariCartPoleTreeNode(
+                        node_id=next_id,
+                        depth=depth + 1,
+                        parent_id=node_id,
+                        branch_index=branch_index,
+                        mode_index=0,
+                        sample_index=branch_index,
+                        probability=node.probability * child_weight,
+                        state=child_state,
+                        prev_action=action,
+                        time=node.time + 1,
+                        belief=child_belief,
+                        branch_weight=child_weight,
+                        mode_probability=1.0,
+                        parameter_sample=float(theta),
+                        process_noise_sample=np.asarray(noise, dtype=float).copy(),
+                        transition_stage_cost=float(stage),
+                        failed=failed,
+                    )
+                    nodes.append(child)
+                    node.children.append(next_id)
+                    next_level.append(next_id)
+                    next_id += 1
+                    branch_index += 1
+        levels.append(next_level)
+
+    dual_cost = 0.0
+    for depth in range(1, dual_horizon + 1):
+        for node_id in levels[depth]:
+            node = nodes[node_id]
+            if node.transition_stage_cost is None:
+                raise RuntimeError("CartPole tree child has no sampled transition cost")
+            dual_cost += node.probability * node.transition_stage_cost
+
+    exploitation_cost = 0.0
+    for leaf_id in levels[dual_horizon]:
+        leaf = nodes[leaf_id]
+        remaining = config.horizon - dual_horizon
+        if leaf.failed:
+            tail = cost.config.failure_cost * max(remaining, 0)
+        else:
+            tail = _cartpole_exploitation_value(
+                leaf.state, leaf.prev_action, leaf.time, leaf.belief.mean, dynamics, cost, config, remaining
+            )
+        exploitation_cost += leaf.probability * tail
+
+    return ArcariCartPoleScenarioTree(
+        nodes=nodes,
+        levels=levels,
+        dual_cost=float(dual_cost),
+        exploitation_cost=float(exploitation_cost),
+        total_cost=float(dual_cost + exploitation_cost),
+        root_action=float(root_action),
+        dual_horizon=dual_horizon,
+        prediction_horizon=config.horizon,
+        branch_factor=branch_factor,
+    )
+
+
+def _arcari_cartpole_best_dual_action_for_node(
+    state: np.ndarray,
+    prev_action: float,
+    t: int,
+    belief: GaussianBelief,
+    dynamics: CartPoleParams,
+    cost: CartPoleCost,
+    config: OfficialCartPoleConfig,
+    depth: int,
+    dual_horizon: int,
+) -> tuple[float, float]:
+    best_action, best_value = 0.0, float("inf")
+    for action in config.action_grid:
         action = float(action)
-        value = _arcari_cartpole_child_expectation(
-            state, action, prev_action, t, belief, dynamics, cost, config, depth=1, dual_horizon=dual_horizon
-        )
+        value = _arcari_cartpole_child_expectation(state, action, prev_action, t, belief, dynamics, cost, config, depth + 1, dual_horizon)
         if value < best_value:
             best_value = value
-            best_u = action
-    return best_u
+            best_action = action
+    return best_action, float(best_value)
 
 
 def _arcari_cartpole_node_value(
@@ -601,15 +1003,8 @@ def _arcari_cartpole_node_value(
 ) -> float:
     if depth >= dual_horizon:
         return _cartpole_exploitation_value(state, prev_action, t, belief.mean, dynamics, cost, config, config.horizon - depth)
-    best = float("inf")
-    for action in config.action_grid:
-        action = float(action)
-        failed = cost.failed(state)
-        value = cost.stage(state, action, prev_action, reference_position(t), failed).total
-        value += _arcari_cartpole_child_expectation(state, action, prev_action, t, belief, dynamics, cost, config, depth + 1, dual_horizon)
-        if value < best:
-            best = value
-    return best
+    _, best_value = _arcari_cartpole_best_dual_action_for_node(state, prev_action, t, belief, dynamics, cost, config, depth, dual_horizon)
+    return best_value
 
 
 def _arcari_cartpole_child_expectation(
@@ -624,13 +1019,11 @@ def _arcari_cartpole_child_expectation(
     depth: int,
     dual_horizon: int,
 ) -> float:
-    scenarios = _sigma_scenarios(belief.mean, belief.var, config.smpc_scenarios)
-    noise_scenarios = _cartpole_noise_scenarios(config)
     expected = 0.0
-    for theta, theta_weight in scenarios:
+    for theta, theta_weight in _sigma_scenarios(belief.mean, belief.var, config.smpc_scenarios):
         nominal_next, _ = cartpole_step(state, action, float(theta), dynamics)
-        for noise, noise_weight in noise_scenarios:
-            next_state = nominal_next + noise
+        for noise, noise_weight in _cartpole_noise_scenarios(config):
+            next_state = np.asarray(nominal_next + noise, dtype=float)
             failed = cost.failed(next_state)
             stage = cost.stage(state, action, prev_action, reference_position(t), failed).total
             if failed:
@@ -643,7 +1036,7 @@ def _arcari_cartpole_child_expectation(
                     next_state, action, t + 1, branch_belief, dynamics, cost, config, depth, dual_horizon
                 )
             expected += theta_weight * noise_weight * branch
-    return expected
+    return float(expected)
 
 
 def _cartpole_noise_scenarios(config: OfficialCartPoleConfig) -> list[tuple[np.ndarray, float]]:
@@ -681,22 +1074,23 @@ def _cartpole_exploitation_value(state: np.ndarray, prev_action: float, t: int, 
     return best
 
 
-def _oracle_cartpole_action(state: np.ndarray, prev_action: float, t: int, theta_path: np.ndarray, dynamics: CartPoleParams, cost: CartPoleCost, config: OfficialCartPoleConfig) -> float:
+def _oracle_cartpole_action(state: np.ndarray, prev_action: float, t: int, theta_path: np.ndarray, noise_path: np.ndarray, dynamics: CartPoleParams, cost: CartPoleCost, config: OfficialCartPoleConfig) -> float:
     best_u, best_value = 0.0, float("inf")
     for action in config.action_grid:
         action = float(action)
         theta = float(theta_path[min(t, len(theta_path) - 1)])
         next_state, _ = cartpole_step(state, action, theta, dynamics)
+        next_state = next_state + noise_path[min(t, len(noise_path) - 1)]
         failed = cost.failed(next_state)
         value = cost.stage(state, action, prev_action, reference_position(t), failed).total
-        value += _oracle_cartpole_value(next_state, action, t + 1, theta_path, dynamics, cost, config, config.horizon - 1)
+        value += _oracle_cartpole_value(next_state, action, t + 1, theta_path, noise_path, dynamics, cost, config, config.horizon - 1)
         if value < best_value:
             best_value = value
             best_u = action
     return best_u
 
 
-def _oracle_cartpole_value(state: np.ndarray, prev_action: float, t: int, theta_path: np.ndarray, dynamics: CartPoleParams, cost: CartPoleCost, config: OfficialCartPoleConfig, horizon: int) -> float:
+def _oracle_cartpole_value(state: np.ndarray, prev_action: float, t: int, theta_path: np.ndarray, noise_path: np.ndarray, dynamics: CartPoleParams, cost: CartPoleCost, config: OfficialCartPoleConfig, horizon: int) -> float:
     if horizon <= 0:
         return cost.terminal(state, reference_position(t)).total
     best = float("inf")
@@ -704,11 +1098,12 @@ def _oracle_cartpole_value(state: np.ndarray, prev_action: float, t: int, theta_
         action = float(action)
         theta = float(theta_path[min(t, len(theta_path) - 1)])
         next_state, _ = cartpole_step(state, action, theta, dynamics)
+        next_state = next_state + noise_path[min(t, len(noise_path) - 1)]
         failed = cost.failed(next_state)
         value = cost.stage(state, action, prev_action, reference_position(t), failed).total
         if failed:
             value += cost.config.failure_cost * max(horizon - 1, 0)
         else:
-            value += _oracle_cartpole_value(next_state, action, t + 1, theta_path, dynamics, cost, config, horizon - 1)
+            value += _oracle_cartpole_value(next_state, action, t + 1, theta_path, noise_path, dynamics, cost, config, horizon - 1)
         best = min(best, value)
     return best

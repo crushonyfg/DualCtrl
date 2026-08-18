@@ -1,0 +1,16 @@
+{
+  "horizon_scalar": 50,
+  "horizon_cartpole": 30,
+  "n_seeds_scalar": 3,
+  "n_seeds_cartpole": 2,
+  "planning_horizon": 3,
+  "cartpole_planning_horizon": 2,
+  "scalar_action_grid_size": 11,
+  "cartpole_action_grid_size": 3,
+  "smpc_dual_horizon_scalar": 2,
+  "smpc_dual_horizon_cartpole": 2,
+  "smpc_scenarios_scalar": 3,
+  "smpc_scenarios_cartpole": 2,
+  "kh_gp_features": 16,
+  "oracle_excluded_from_baseline_summary": true
+}

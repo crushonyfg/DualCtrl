@@ -32,12 +32,12 @@ def make_regime(kind: str, horizon: int) -> ScalarRegimeConfig:
     raise ValueError(kind)
 
 
-def build_controllers(b_path: np.ndarray, cost: ScalarCost, config: OfficialScalarConfig, seed: int, discrepancy: float):
+def build_controllers(b_path: np.ndarray, noise_path: np.ndarray, cost: ScalarCost, config: OfficialScalarConfig, seed: int, discrepancy: float):
     return [
         KHDualControlScalar(GaussianBelief(mean=1.0, var=10.0), cost, config),
         ArcariDualSMPCScalar(GaussianBelief(mean=1.0, var=10.0), cost, config, seed=seed),
         TVGPLCBScalar(cost, config),
-        OracleTrendScalar(b_path, cost, config, discrepancy_quadratic=discrepancy),
+        OracleTrendScalar(b_path, cost, config, discrepancy_quadratic=discrepancy, noise_path=noise_path),
     ]
 
 
@@ -65,7 +65,7 @@ def run_one_setting(args: argparse.Namespace, twin_gap: str, regime_kind: str) -
         b_path = generate_b_path(regime, rng)
         process_noise = rng.normal(0.0, args.process_std, size=args.horizon)
         obs_noise = rng.normal(0.0, args.observation_std, size=args.horizon)
-        controllers = build_controllers(b_path, cost, config, seed, discrepancy)
+        controllers = build_controllers(b_path, process_noise, cost, config, seed, discrepancy)
         seed_costs = {}
         for controller in controllers:
             env = ScalarPhysicalEnv(
