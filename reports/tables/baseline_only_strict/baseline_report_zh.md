@@ -14,13 +14,13 @@
 
 代码内部以 cost 最小化实现；报告同时给出 reward 与 cost。二者关系为：
 
-\[
+$$
 \text{net reward} = -\text{total cost}.
-\]
+$$
 
 每条 trajectory 的 total cost 分解为：
 
-\[
+$$
 C_T
 =
 \sum_{t=0}^{T-1}
@@ -32,7 +32,7 @@ C_T
 +
 \sum_{t=0}^{T-1} c_{\text{failure},t}
 +\ell_T^{\text{term}}.
-\]
+$$
 
 报告中的列含义：
 
@@ -56,28 +56,28 @@ C_T
 
 scalar 严格复现 Klenske & Hennig 2016 的线性 toy system：
 
-\[
+$$
 x_{k+1}=a x_k + b u_k + \xi_k,
 \qquad
 \xi_k\sim\mathcal N(0,Q),
-\]
+$$
 
-其中 \(a\) 已知，\(b\) 未知，belief 为：
+其中 $a$ 已知，$b$ 未知，belief 为：
 
-\[
+$$
 b\mid\mathcal D_k \sim \mathcal N(\mu_k,\sigma_k^2).
-\]
+$$
 
 Klenske-Hennig 的 approximate dual control 分三步：
 
-1. **certainty-equivalent nominal trajectory**：用当前 posterior mean \(\mu_k\) 构造 nominal system；
+1. **certainty-equivalent nominal trajectory**：用当前 posterior mean $\mu_k$ 构造 nominal system；
 2. **augmented-state quadratic expansion**：把 state 和 parameter 合成 augmented state：
-   \[
+   $$
    z_k=(x_k,b_k),
-   \]
+   $$
    在线性化的 augmented dynamics 上传播 covariance；
-3. **dual uncertainty cost**：用 Riccati recursion 得到 perturbation value matrix \(\tilde K_j\)，并计算 uncertainty cost：
-   \[
+3. **dual uncertainty cost**：用 Riccati recursion 得到 perturbation value matrix $\tilde K_j$，并计算 uncertainty cost：
+   $$
    J_k^d
    =
    \frac12\operatorname{tr}\left(
@@ -90,29 +90,29 @@ Klenske-Hennig 的 approximate dual control 分三步：
    (\Sigma_{j+1|j}-\Sigma_{j+1|j+1})\tilde K_{j+1}
    \right]
    \right).
-   \]
+   $$
 
 最终优化：
 
-\[
+$$
 u_k^* = \arg\min_{u_k}\ \bar J_k(u_k)+J_k^d(u_k),
-\]
+$$
 
-其中 \(\bar J_k\) 是 nominal CE cost，\(J_k^d\) 是 approximate dual uncertainty cost。当前 benchmark action set 是 finite grid，因此 root action optimization 是对 finite grid 的精确枚举。
+其中 $\bar J_k$ 是 nominal CE cost，$J_k^d$ 是 approximate dual uncertainty cost。当前 benchmark action set 是 finite grid，因此 root action optimization 是对 finite grid 的精确枚举。
 
 #### CartPole GP 版本
 
 CartPole 中使用 KH paper Section 5.2 / 5.2.1 的 finite-feature GP dynamics 思路。模型不是 actuator-gain pseudo-belief，而是对 transition residual 建模：
 
-\[
+$$
 s_{t+1}=s_t+W\phi([s_t,a_t])+\epsilon_t.
-\]
+$$
 
-其中 \(\phi(\cdot)\) 是 squared-exponential kernel 的 finite Fourier feature approximation，\(W\) 是 GP weight-space 参数。augmented state 为：
+其中 $\phi(\cdot)$ 是 squared-exponential kernel 的 finite Fourier feature approximation，$W$ 是 GP weight-space 参数。augmented state 为：
 
-\[
+$$
 z_t=(s_t,\operatorname{vec}(W)).
-\]
+$$
 
 实现包含：
 
@@ -129,14 +129,14 @@ z_t=(s_t,\operatorname{vec}(W)).
 
 ### 2.2 Arcari dual stochastic MPC (`arcari_dual_smpc`)
 
-Arcari et al. 2020 的方法是 dual stochastic MPC。其核心思想是把 MPC horizon \(N\) 分成：
+Arcari et al. 2020 的方法是 dual stochastic MPC。其核心思想是把 MPC horizon $N$ 分成：
 
-- dual part：长度 \(L\)，用 scenario tree 主动获取信息；
-- exploitation part：长度 \(N-L\)，在每个 leaf 固定已获得的信息后做 exploitation planning。
+- dual part：长度 $L$，用 scenario tree 主动获取信息；
+- exploitation part：长度 $N-L$，在每个 leaf 固定已获得的信息后做 exploitation planning。
 
-在无 structural mode 的主实验中，\(n_m=1\)。scenario tree 的每个 child node 按参数样本和过程噪声样本展开。scalar 中对应：
+在无 structural mode 的主实验中，$n_m=1$。scenario tree 的每个 child node 按参数样本和过程噪声样本展开。scalar 中对应：
 
-\[
+$$
 x^{j_{k+1}}_{k+1}
 =
  x^{P(j_{k+1})}_k
@@ -144,17 +144,17 @@ x^{j_{k+1}}_{k+1}
 \gamma^{j_{k+1}}_k u^{P(j_{k+1})}_k
 +
 w^{j_{k+1}}_k.
-\]
+$$
 
 CartPole 中对应：
 
-\[
+$$
 s^{j_{k+1}}_{k+1}
 =
 f_{\text{twin}}(s^{P(j_{k+1})}_k,u^{P(j_{k+1})}_k,\gamma^{j_{k+1}}_k)
 +
 w^{j_{k+1}}_k.
-\]
+$$
 
 每个 node 保存：
 
@@ -168,7 +168,7 @@ w^{j_{k+1}}_k.
 
 objective 对应 paper Eq. (10)：
 
-\[
+$$
 \min_{u_0,\ldots,u_{N-1}}
 \sum_{k=0}^{L-1}
 \frac{1}{N_s^k}
@@ -180,9 +180,9 @@ objective 对应 paper Eq. (10)：
 \sum_{j_L}
 \bar p^{j_L}_L
 \tilde J_L(I^{j_L}_L).
-\]
+$$
 
-其中 \(\tilde J_L\) 是 exploitation part 的 fixed-information cost-to-go。当前实现使用 finite action grid，因此是 **finite-action Arcari DMPC specialization**：对给定 finite action set 上的 tree-node actions 做精确枚举，而不是 continuous nonlinear optimizer。
+其中 $\tilde J_L$ 是 exploitation part 的 fixed-information cost-to-go。当前实现使用 finite action grid，因此是 **finite-action Arcari DMPC specialization**：对给定 finite action set 上的 tree-node actions 做精确枚举，而不是 continuous nonlinear optimizer。
 
 ---
 
@@ -190,57 +190,57 @@ objective 对应 paper Eq. (10)：
 
 Bogunovic et al. 2016 的 time-varying GP bandit 模型为：
 
-\[
+$$
 f_{t+1}(x)=\sqrt{1-\epsilon}\,f_t(x)+\sqrt{\epsilon}\,g_{t+1}(x),
-\]
+$$
 
 其中：
 
-\[
+$$
 g_{t+1}\sim\mathcal{GP}(0,k_x).
-\]
+$$
 
 诱导 time-space kernel：
 
-\[
+$$
 k((x,t),(x',t'))
 =(1-\epsilon)^{|t-t'|/2}k_x(x,x').
-\]
+$$
 
 GP posterior：
 
-\[
+$$
 \mu_t(x)=k_*^\top(K+\\sigma^2I)^{-1}y,
-\]
+$$
 
-\[
+$$
 \sigma_t^2(x)=k(x,x)-k_*^\top(K+\sigma^2I)^{-1}k_*.
-\]
+$$
 
 原 paper 用 UCB 做 reward maximization：
 
-\[
+$$
 x_t=\arg\max_x \mu_{t-1}(x)+\sqrt{\beta_t}\sigma_{t-1}(x).
-\]
+$$
 
 本 benchmark 是 cost minimization，因此使用 LCB：
 
-\[
+$$
 a_t=\arg\min_a \mu_{t-1}(\psi_t(a))-
 \sqrt{\beta_t}\sigma_{t-1}(\psi_t(a)).
-\]
+$$
 
-其中 \(\psi_t(a)\) 是当前 context-action feature。scalar 使用：
+其中 $\psi_t(a)$ 是当前 context-action feature。scalar 使用：
 
-\[
+$$
 \psi_t(a)=(x_t,a_{t-1},a),
-\]
+$$
 
 CartPole 使用：
 
-\[
+$$
 \psi_t(a)=(s_t,a_{t-1},a).
-\]
+$$
 
 该 baseline 是 **finite-action TV-GP-LCB on realized one-step costs**。它不是 MPC，也不是 dual control；它只根据 realized one-step cost feedback 更新 GP。
 
