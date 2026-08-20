@@ -48,6 +48,9 @@ def enrich_scalar(rows: list[dict[str, str]]) -> list[dict]:
                 "terminal_cost": terminal,
                 "total_cost": total,
                 "net_reward": -total,
+                "mean_abs_action": float(r.get("mean_abs_action", 0.0)),
+                "frac_zero_action": float(r.get("frac_zero_action", 0.0)),
+                "action_changes": float(r.get("action_changes", 0.0)),
                 "physical_transitions": int(float(r["physical_transitions"])),
                 "observed_transitions": int(float(r["observed_transitions"])),
                 "observation_interval": int(float(r["observation_interval"])),
@@ -67,17 +70,23 @@ def enrich_cartpole(rows: list[dict[str, str]]) -> list[dict]:
         failure = float(r["failure_cost"])
         terminal = float(r["terminal_cost"])
         total = float(r["total_cost"])
+        nonsmooth = float(r.get("nonsmooth_switch_cost", 0.0))
         out.append(
             {
                 **{k: r[k] for k in ["environment", "twin_gap", "regime", "seed", "baseline"]},
                 "acc_task_reward": -task,
                 "acc_energy_cost": energy,
-                "acc_switch_cost": switch,
+                "acc_switch_cost": switch + nonsmooth,
                 "acc_failure_cost": failure,
                 "terminal_cost": terminal,
                 "total_cost": total,
                 "net_reward": -total,
+                "violation_steps": float(r.get("violation_steps", r["failures"])),
                 "failures": float(r["failures"]),
+                "failure_events": float(r.get("failure_events", 0.0)),
+                "mean_abs_action": float(r.get("mean_abs_action", 0.0)),
+                "frac_zero_action": float(r.get("frac_zero_action", 0.0)),
+                "action_changes": float(r.get("action_changes", 0.0)),
                 "physical_transitions": int(float(r["physical_transitions"])),
                 "observed_transitions": int(float(r["observed_transitions"])),
                 "observation_interval": int(float(r["observation_interval"])),
@@ -91,7 +100,7 @@ def summarize(rows: list[dict]) -> list[dict]:
     for r in rows:
         groups[(r["environment"], r["twin_gap"], r["regime"], r["baseline"])].append(r)
     summary = []
-    metrics = ["net_reward", "total_cost", "acc_task_reward", "acc_energy_cost", "acc_switch_cost", "acc_failure_cost", "terminal_cost"]
+    metrics = ["net_reward", "total_cost", "acc_task_reward", "acc_energy_cost", "acc_switch_cost", "acc_failure_cost", "terminal_cost", "mean_abs_action", "frac_zero_action", "action_changes"]
     for key in sorted(groups):
         sub = groups[key]
         row = {
@@ -108,6 +117,13 @@ def summarize(rows: list[dict]) -> list[dict]:
         if "failures" in sub[0]:
             vals = np.array([float(r["failures"]) for r in sub], dtype=float)
             row["mean_failures"] = float(vals.mean())
+        if "violation_steps" in sub[0]:
+            vals = np.array([float(r["violation_steps"]) for r in sub], dtype=float)
+            row["mean_violation_steps"] = float(vals.mean())
+        if "failure_events" in sub[0]:
+            vals = np.array([float(r["failure_events"]) for r in sub], dtype=float)
+            row["mean_failure_events"] = float(vals.mean())
+            row["max_failure_events"] = float(vals.max())
         summary.append(row)
     return summary
 

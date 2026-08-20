@@ -27,7 +27,20 @@ class ScalarRegimeConfig:
     multimodal_values: tuple[float, ...] = (0.8, 1.6, 2.4)
 
 
+def _effective_change_points(change_points: tuple[int, ...], horizon: int, n_values: int) -> tuple[int, ...]:
+    cps = tuple(sorted({int(cp) for cp in change_points if 0 < int(cp) < horizon}))
+    needed = max(n_values - 1, 0)
+    if len(cps) >= needed:
+        return cps[:needed]
+    if needed == 0:
+        return ()
+    fallback = tuple(max(1, min(horizon - 1, int(round(horizon * k / n_values)))) for k in range(1, n_values))
+    return tuple(sorted({*cps, *fallback}))[:needed]
+
+
 def generate_b_path(config: ScalarRegimeConfig, rng: np.random.Generator) -> np.ndarray:
+    if config.horizon <= 0:
+        raise ValueError("horizon must be positive")
     b = np.empty(config.horizon, dtype=float)
     if config.kind == "static":
         b.fill(config.base)
@@ -42,7 +55,7 @@ def generate_b_path(config: ScalarRegimeConfig, rng: np.random.Generator) -> np.
 
     if config.kind == "fixed_jumps":
         values = config.fixed_values
-        cps = config.change_points
+        cps = _effective_change_points(config.change_points, config.horizon, len(values))
         for t in range(config.horizon):
             idx = sum(t >= cp for cp in cps)
             b[t] = values[min(idx, len(values) - 1)]

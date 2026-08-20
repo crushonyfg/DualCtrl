@@ -6,7 +6,7 @@ CartPole benchmark.  The unknown dynamics are represented in weight space by a
 finite random Fourier feature approximation to a squared-exponential GP over
 state-action inputs.  The controller models CartPole transition deltas,
 
-    x[k+1] = x[k] + W phi([x[k], u[k]]) + eps,
+    x[k+1] = f_nominal(x[k], u[k]) + W phi([x[k], u[k]]) + eps,
     vec(W)[k+1] = vec(W)[k],
 
 with independent GP outputs.  Planning uses the Sec. 4 approximate-dual recipe:
@@ -27,13 +27,18 @@ from itertools import product
 import numpy as np
 
 from benchmarks.cartpole_twin.costs import CartPoleCost
-from benchmarks.cartpole_twin.dynamics import CartPoleParams, reference_position
+from benchmarks.cartpole_twin.dynamics import CartPoleParams, cartpole_step, reference_position
+from controllers.action_optimization import minimize_scalar_action, minimize_vector_actions
 
 
 @dataclass(frozen=True)
 class KHGPConfig:
     horizon: int = 4
     action_grid_size: int = 7
+    continuous_actions: bool = False
+    optimizer_grid_size: int = 81
+    optimizer_maxiter: int = 100
+    optimizer_xatol: float = 1e-4
     num_features: int = 32
     lengthscale: float = 1.0
     signal_var: float = 1.0
@@ -177,10 +182,10 @@ class MultiOutputBayesLinearGP:
 class KHGPPosteriorBlocks:
     """Equation-level KH GP posterior blocks for finite-feature weight space.
 
-    The controlled CartPole benchmark uses residual dynamics
-    ``x[j+1] = x[j] + W phi([x[j], u[j]]) + q[j]``.  Along a fixed nominal
+    The controlled CartPole benchmark uses nominal-plus-residual dynamics
+    ``x[j+1] = f_nominal(x[j], u[j]) + W phi([x[j], u[j]]) + q[j]``.  Along a fixed
     action sequence, actions are treated as deterministic design variables, so
-    the KH Sec. 5.2/App. A.2 GP posterior is applied to the linearized residual
+    the KH Sec. 5.2/App. A.2 GP posterior is applied to the locally linearized
     model ``x[j+1] = A[j] x[j] + Phi[j] w + q[j]`` with observations of the
     next physical state.  This is the finite-dimensional weight-space form of
     Eqs. (16)/(17): ``K`` is represented by ``Phi Sigma_ww Phi^T`` rather than
@@ -387,21 +392,37 @@ class KHGPControllerCartPole:
         weights = self.model.mean if flat_weights is None else np.asarray(flat_weights, dtype=float).reshape(4, self.config.num_features)
         return weights @ phi
 
+    def nominal_next_state(self, state: np.ndarray, action: float) -> np.ndarray:
+        next_state, _ = cartpole_step(np.asarray(state, dtype=float).reshape(4), float(action), 1.0, self.dynamics)
+        return next_state
+
     def mean_next_state(self, state: np.ndarray, action: float, flat_weights: np.ndarray | None = None) -> np.ndarray:
-        return np.asarray(state, dtype=float).reshape(4) + self.transition_delta_mean(state, action, flat_weights)
+        return self.nominal_next_state(state, action) + self.transition_delta_mean(state, action, flat_weights)
 
     def observe(self, state: np.ndarray, action: float, next_state: np.ndarray) -> None:
         # Strict GP dynamics observation: transition delta only.  This deliberately
         # avoids the old CartPole actuator-gain/theta pseudo-observation.
-        delta = np.asarray(next_state, dtype=float).reshape(4) - np.asarray(state, dtype=float).reshape(4)
+        delta = np.asarray(next_state, dtype=float).reshape(4) - self.nominal_next_state(state, action)
         self.model.update(self._input(state, action), delta, noise_var=self.config.gp_noise_var)
         self.t += 1
 
     def act(self, state: np.ndarray, prev_action: float) -> float:
+        state = np.asarray(state, dtype=float).reshape(4)
+        if self.config.continuous_actions:
+            action, _ = minimize_scalar_action(
+                lambda u: self.approximate_dual_cost(state, float(prev_action), float(u), self.t),
+                -1.0,
+                1.0,
+                self.config.optimizer_grid_size,
+                self.config.optimizer_maxiter,
+                self.config.optimizer_xatol,
+            )
+            return float(action)
+
         best_action = 0.0
         best_value = float("inf")
         for action in self.config.action_grid:
-            value = self.approximate_dual_cost(np.asarray(state, dtype=float).reshape(4), float(prev_action), float(action), self.t)
+            value = self.approximate_dual_cost(state, float(prev_action), float(action), self.t)
             if value < best_value:
                 best_value = value
                 best_action = float(action)
@@ -424,6 +445,30 @@ class KHGPControllerCartPole:
         xs0.append(self.mean_next_state(xs0[0], us0[0]))
         if horizon == 1:
             return np.asarray(xs0), np.asarray(us0)
+
+        if self.config.continuous_actions:
+            def tail_objective(tail_actions: np.ndarray) -> float:
+                xs = [x.copy() for x in xs0]
+                us = list(us0)
+                for u in np.asarray(tail_actions, dtype=float).reshape(-1):
+                    us.append(float(u))
+                    xs.append(self.mean_next_state(xs[-1], float(u)))
+                return _quadratic_rollout_cost_for_tail(np.asarray(xs), np.asarray(us), prev_action, self.cost)
+
+            tail_actions, _ = minimize_vector_actions(
+                tail_objective,
+                [(-1.0, 1.0)] * (horizon - 1),
+                x0=[0.0] * (horizon - 1),
+                grid_size=self.config.optimizer_grid_size,
+                maxiter=self.config.optimizer_maxiter,
+                xatol=self.config.optimizer_xatol,
+            )
+            xs = [x.copy() for x in xs0]
+            us = list(us0)
+            for u in tail_actions:
+                us.append(float(u))
+                xs.append(self.mean_next_state(xs[-1], float(u)))
+            return np.asarray(xs), np.asarray(us)
 
         action_tuple_grid = tuple(float(u) for u in self.config.action_grid)
         best_tail: tuple[float, list[np.ndarray], list[float]] | None = None

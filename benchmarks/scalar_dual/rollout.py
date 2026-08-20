@@ -31,6 +31,22 @@ class ScalarTrajectory:
     belief_means: list[float] = field(default_factory=list)
     belief_vars: list[float] = field(default_factory=list)
 
+    @property
+    def mean_abs_action(self) -> float:
+        return float(np.mean(np.abs(self.us))) if self.us else 0.0
+
+    @property
+    def frac_zero_action(self) -> float:
+        return float(np.mean(np.isclose(self.us, 0.0))) if self.us else 0.0
+
+    @property
+    def action_changes(self) -> int:
+        if not self.us:
+            return 0
+        prev = np.array([0.0, *self.us[:-1]], dtype=float)
+        cur = np.array(self.us, dtype=float)
+        return int(np.sum(~np.isclose(cur, prev)))
+
 
 def run_scalar_rollout(
     env: ScalarPhysicalEnv,
@@ -67,12 +83,25 @@ def run_scalar_rollout(
         if step.observed_next_x is not None:
             controller.observe(step.x, step.u, step.observed_next_x, obs_var)
             observed_transitions += 1
+        else:
+            _advance_unobserved_controller_time(controller)
     terminal = cost.terminal(env.x)
     traj.terminal_cost = terminal.total
     traj.total_cost += terminal.total
     traj.observed_transitions = observed_transitions
     traj.xs.append(float(env.x))
     return traj
+
+
+def _advance_unobserved_controller_time(controller: ScalarController) -> None:
+    """Advance deployment clocks without giving hidden transitions to filters."""
+    if getattr(controller, "name", "") == "tv_gp_lcb":
+        return
+    if hasattr(controller, "t"):
+        try:
+            controller.t += 1
+        except (AttributeError, TypeError):
+            pass
 
 
 def paired_bootstrap_ci(values: np.ndarray, rng: np.random.Generator, n_boot: int = 1000, alpha: float = 0.05) -> tuple[float, float]:

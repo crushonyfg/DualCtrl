@@ -38,7 +38,10 @@ Primary metric 使用 undiscounted realized return（即 $\gamma=1$），因为�
 
 - **Digital twin**：算法内部可调用的 simulator/world model；输入状态、动作和 calibration parameter，输出下一状态或 response。它可以被多次调用，但 simulator call 数和 wall-clock time 要记录。
 - **Physical system**：只沿当前真实轨迹前进一步；其 transition 不可查询后撤，也不可为同一状态尝试多个动作。
-- **Physical data**：不是额外免费获得的数据集。每一步只有被执行动作产生的 $(s_t,a_t,r_t,s_{t+1})$，而该动作的 operational cost 已计入累计代价。首轮还应单独测试 physical data 稀疏的情形：physical sampling 可能远慢于 digital-twin rollout，因而每条 deployment 中可用于 recalibration 的真实 transitions 很少；这正是 digital twin 相比纯 model-free online learning 的重要动机之一。
+- **Physical data / observation channels**：不是额外免费获得的数据集。需要区分两条观测通道：
+  - **control-state observation** $s_t$：控制器每个 control step 都需要的高频反馈状态（或由状态估计器给出的 control state），用于选择 $a_t$、计算当期 operational reward/cost，并推进不可重放的真实轨迹；
+  - **calibration measurement** $y^{\mathrm{cal}}_k$：低频、昂贵或延迟的校准观测，用于更新 digital twin / parameter belief。它可以是某个 transition summary、批量日志或 interval aggregate，例如 $y^{\mathrm{cal}}_k=g(s_{\tau_k:\tau_{k+1}},a_{\tau_k:\tau_{k+1}-1},r_{\tau_k:\tau_{k+1}-1})+\eta_k$。
+  标准密集设置中，每一步的 executed transition $(s_t,a_t,r_t,s_{t+1})$ 都可形成 calibration signal；sparse physical data 设置中，真实系统仍每个 control step 前进、暴露控制所需的 $s_t$ 并计入 cost，但只有低频 $y^{\mathrm{cal}}_k$ 可用于 recalibration。也就是说，稀疏 physical data **不是简单把 $s_{t+1}$ 从控制回路里 drop 掉**，而是把“高频控制反馈”和“低频校准数据”分离；否则 benchmark 会退化成 partial observability / missing-state control，而不是 digital-twin recalibration 稀疏。
 - **参数**：$\theta_t$ 是 physical system 的隐变量。控制器看不到它，只能通过 physical transitions 推断。首轮先假设 $\theta_t$ 的演化是 exogenous，即 $p(\theta_{t+1}\mid\theta_t)$，不让 action 直接影响 degradation/wear；action-dependent $p(\theta_{t+1}\mid\theta_t,s_t,a_t)$ 只作为后续扩展。
 
 ### 2.2 统一的 physical reward 与 action cost
@@ -149,14 +152,29 @@ Toy benchmark 中 Bayes oracle 可通过参数网格、Gaussian quadrature 和 b
 
 ### 2.6 稀疏 physical data / fast digital twin 测试
 
-除每个 control step 都产生 physical transition 的标准设置外，首轮应加入一个单独的 sparse-physical-data stress test。动机是 digital twin 场景下 physical sampling 往往慢、贵或有安全约束，而 twin rollout 可以快很多；因此算法可能每个 physical interval 内能做大量 simulator planning，但只能偶尔获得真实 recalibration signal。
+除每个 control step 都产生 physical transition 且每步 transition 都可用于 recalibration 的标准设置外，首轮应加入一个单独的 sparse-physical-data stress test。动机是 digital twin 场景下**控制状态反馈**通常仍需高频闭环可用，但**可用于校准 twin 的物理测量**往往慢、贵、延迟或受安全/人工检测约束；与此同时 twin rollout 可以快很多。因此算法可能每个 physical interval 内能做大量 simulator planning，并在每个 control step 看到控制所需的 $s_t$，但只能偶尔获得真实 recalibration signal $y^{\mathrm{cal}}$。
 
-建议先实现两种等价诊断方式：
+建议在配置中显式编码两个 interval，避免把 sparse calibration 误实现为 missing state feedback：
 
-1. **Subsampled observation / update**：physical system 每一步仍真实前进并计入 cost，但只有每 $m$ 步获得一次用于 posterior update 的 transition summary，$m\in\{1,5,10,20\}$。未观测步只用于累计 reward/cost，不能被算法当成免费 calibration data。
-2. **Coarse physical decision interval**：一个 physical action/recipe 持续 $m$ 个 simulator time steps，期间 digital twin 可用于内部 rollout，但真实系统只在 interval 末端回传一个 aggregated transition/reward。这个版本更贴近 physical sampling frequency 低于 digital-twin simulation frequency 的 setting。
+```yaml
+control_observation_interval: 1        # 每隔多少个 control step 向 controller 提供 s_t；主实验默认 1
+calibration_observation_interval: m    # 每隔多少个 control step 产生 y^cal_k / calibration transition summary
+```
 
-在 sparse setting 下，$\theta_t$ 或 $\delta_t$ 的 drift 应相对 physical sampling 更慢，或者以 sudden change 形式出现；否则所有方法都会因为信息论限制同时失败，无法诊断 dual-control 方法本身。报告时需要同时给出 physical transitions 数、可用于 calibration 的 observed transitions 数、digital-twin calls 数和 wall-clock time。
+语义约定：
+
+- `control_observation_interval` 控制高频闭环状态反馈 $s_t$ 的可用性。首轮 sparse physical data stress test 应保持 `control_observation_interval: 1`，即 controller 仍按正常反馈控制真实系统。
+- `calibration_observation_interval` 控制能否把 physical trajectory 用于 posterior / twin recalibration。主 sweep 使用 $m\in\{1,5,10,20\}$；`m=1` 是密集校准基线。
+- 当前代码里已有的 `observation_interval` 更准确地对应 `calibration_observation_interval`，因为 rollout 仍每步让环境前进并计 cost，只是隔 $m$ 步才调用 controller/filter 的 `observe(...)`。在正式 config / CSV / report 中应逐步重命名或至少加别名说明，避免读者以为控制器在未观测步连 $s_t$ 都看不到。
+
+建议先实现两种诊断方式：
+
+1. **Subsampled calibration update**：physical system 每一步仍真实前进、controller 每步接收 control state $s_t$ 并计入 cost，但只有每 $m$ 步获得一次用于 posterior update 的 calibration measurement $y^{\mathrm{cal}}_k$（例如 transition summary）。非校准步的状态和 reward 只用于控制与评价，不能被算法当成免费 calibration data。
+2. **Coarse calibration / assay interval**：一个 physical action/recipe 仍可在 control steps 上闭环调整；但 expensive assay、quality inspection 或 system-identification batch 只在 interval 末端回传 aggregated $y^{\mathrm{cal}}_k$。若要研究“一个 recipe 持续 $m$ 步不变”的低频决策问题，应另设 `decision_interval` 或 action-hold stress test，不应混同为 sparse physical calibration data。
+
+因此，sparse physical data 的核心不是简单删除 $(s_t,a_t,r_t,s_{t+1})$ 中的 $s_{t+1}$，而是只限制哪些 trajectory-derived measurements 能进入 calibration likelihood / posterior update。若把 $s_{t+1}$ 对 controller 完全隐藏，问题会变成 delayed/partial state observation，需要另行标注并使用相应 baselines。
+
+在 sparse setting 下，$\theta_t$ 或 $\delta_t$ 的 drift 应相对 calibration sampling 更慢，或者以 sudden change 形式出现；否则所有方法都会因为信息论限制同时失败，无法诊断 dual-control 方法本身。报告时需要同时给出 physical control steps / transitions 数、control-state observations 数、可用于 calibration 的 observed calibration measurements/transitions 数、digital-twin calls 数和 wall-clock time。
 
 ### 2.7 统一评价指标
 
@@ -172,7 +190,7 @@ Toy benchmark 中 Bayes oracle 可通过参数网格、Gaussian quadrature 和 b
 - change 后 time-to-recover：rolling cost 回到 oracle 的 10% 容差带所需步数；
 - $\theta_t$ posterior mean error、negative log predictive density、credible-interval coverage；
 - posterior entropy/variance 与真实 calibration error 的关系，用于识别“自信但错误”；
-- physical transitions 数、observed calibration transitions 数、digital-twin calls 数和 wall-clock time。
+- physical control steps / transitions 数、control-state observations 数、observed calibration measurements/transitions 数、digital-twin calls 数和 wall-clock time。
 
 所有曲线画 paired mean/median 和 95% bootstrap CI；同时报告 tail risk（90% 或 95% quantile cost），但 primary objective 仍是 realized cumulative cost。这里的 quantile 是**评价指标**，不先偷换成方法的优化目标。
 
@@ -421,7 +439,7 @@ $$
 
 ### 5.1 随机种子和统计量
 
-- Scalar：建议至少 1,000 条 paired deployment trajectories；计算便宜，可做到 5,000。sparse physical data 版本需要扫 observation interval $m$，但仍使用 paired seeds。
+- Scalar：建议至少 1,000 条 paired deployment trajectories；计算便宜，可做到 5,000。sparse physical data 版本需要扫 `calibration_observation_interval` $m$，同时保持 `control_observation_interval=1` 并使用 paired seeds。
 - CartPole：先用 100 条 pilot，正式结果至少 200 条 paired trajectories。
 - 相同 seed 下共享 $\theta$ path、process noise、observation noise、physical observation mask 和初始状态。
 - 超参数只在独立 validation seeds 上调；test seeds 不再调 process noise、planning horizon 或 cost weights。
@@ -467,8 +485,8 @@ $$
 2. 包装成不可重放的 $T_{\mathrm{dep}}=300$ deployment loop；
 3. 加 slow drift 与 fixed jumps；
 4. 加 KH-AD-RW、CE-RW、Bayes oracle 和 clairvoyant；
-5. 加 sparse physical data、non-smooth switching cost 和 multimodal regime 的 scalar stress tests；
-6. 输出总成本表、paired regret、change-aligned recovery plot、posterior plot、physical/calibration transition 数和 twin-call budget 曲线；
+5. 加 sparse physical data、non-smooth switching cost 和 multimodal regime 的 scalar stress tests；其中 sparse physical data 应先实现 dual-channel 观测语义（`control_observation_interval` vs. `calibration_observation_interval`）；
+6. 输出总成本表、paired regret、change-aligned recovery plot、posterior plot、physical control step / calibration measurement 数和 twin-call budget 曲线；
 7. scalar 机制验证通过后，再实现 CartPole matched family；最后才加入 discrepancy。
 
 建议首轮代码产物：
@@ -497,7 +515,7 @@ reports/
 - benchmark A 使用 actuator gain 作为一维 $\theta_t$，而非一开始同时漂移 mass、length 和 friction；
 - primary objective 用 expected realized cumulative cost，quantile/CVaR 先作为 secondary metric；
 - scalar 中同时报告 $\lambda_\Delta=0$ 和 $0.05$，再加入一个 non-smooth migration cost stress test；
-- sparse physical data 作为单独 stress test，先扫 $m\in\{1,5,10,20\}$；
+- sparse physical data 作为单独 stress test，先固定 `control_observation_interval=1`，扫 `calibration_observation_interval` $m\in\{1,5,10,20\}$；
 - CartPole 先做 matched family，再加 actuator lag + Coulomb friction；
 - oracle 同时保留 Bayes oracle/reference 和 clairvoyant ceiling；
 - 第一轮不用 learned surrogate，也不引入 proposed method。

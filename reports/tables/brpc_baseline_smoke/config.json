@@ -1,0 +1,16 @@
+{
+  "horizon": 3,
+  "seeds": [
+    0
+  ],
+  "cold_start_transitions": 2,
+  "num_particles": 8,
+  "inducing_points": 6,
+  "cem_horizon": 2,
+  "cem_population": 4,
+  "cem_iterations": 1,
+  "bocpd_hazard": 0.15,
+  "bocpd_max_experts": 4,
+  "bocpd_min_segment_length": 1,
+  "output_note": "lightweight smoke/small run; not a formal statistical experiment"
+}

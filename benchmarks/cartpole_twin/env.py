@@ -28,6 +28,7 @@ class CartPoleStep:
     observed_next_state: np.ndarray | None
     cost: CartPoleCostBreakdown
     failed: bool
+    failure_event: bool
     p_ref: float
 
 
@@ -57,6 +58,7 @@ class CartPolePhysicalEnv:
         self.prev_action = 0.0
         self.prev_force = 0.0
         self.absorbed = False
+        self.failure_event_emitted = False
 
     def step(self, action: float, observe: bool = True) -> CartPoleStep:
         if self.t >= self.horizon:
@@ -66,13 +68,18 @@ class CartPolePhysicalEnv:
         theta = float(self.theta_path[self.t])
         clipped_action = float(np.clip(action, -1.0, 1.0))
         p_ref = reference_position(self.t, self.config.reference_segment)
-        if self.absorbed:
+        already_absorbed = self.absorbed
+        if already_absorbed:
             next_state = state.copy()
             failed = True
+            failure_event = False
         else:
             next_state, self.prev_force = cartpole_step(state, clipped_action, theta, self.dynamics, self.prev_force)
             next_state = next_state + self.process_noise[self.t]
             failed = self.cost.failed(next_state)
+            failure_event = failed and not self.failure_event_emitted
+            if failure_event:
+                self.failure_event_emitted = True
             if failed and self.config.absorbing_failure:
                 self.absorbed = True
         stage_cost = self.cost.stage(state, clipped_action, prev_action, p_ref, failed)
@@ -89,5 +96,6 @@ class CartPolePhysicalEnv:
             observed_next_state=observed_next_state,
             cost=stage_cost,
             failed=failed,
+            failure_event=failure_event,
             p_ref=p_ref,
         )

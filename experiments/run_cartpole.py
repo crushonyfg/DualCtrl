@@ -48,21 +48,37 @@ def main() -> None:
             env = CartPolePhysicalEnv(CartPoleEnvConfig(), dynamics, cost, theta_path, process_noise)
             traj = run_cartpole_rollout(env, controller, cost, args.observation_interval)
             seed_costs[controller.name] = traj.total_cost
+            task_cost = float(np.sum(traj.task_costs))
+            energy_cost = float(np.sum(traj.energy_costs))
+            switch_cost = float(np.sum(traj.switch_costs))
+            nonsmooth_switch_cost = float(np.sum(traj.nonsmooth_switch_costs))
+            failure_cost = float(np.sum(traj.failure_costs))
             rows.append(
                 {
                     "seed": seed,
                     "controller": controller.name,
                     "regime": args.regime,
                     "total_cost": traj.total_cost,
+                    "net_reward": -traj.total_cost,
                     "terminal_cost": traj.terminal_cost,
                     "physical_transitions": traj.physical_transitions,
                     "observed_transitions": traj.observed_transitions,
                     "observation_interval": args.observation_interval,
+                    "violation_steps": traj.failures,
                     "failures": traj.failures,
-                    "task_cost": float(np.sum(traj.task_costs)),
-                    "energy_cost": float(np.sum(traj.energy_costs)),
-                    "switch_cost": float(np.sum(traj.switch_costs)),
-                    "failure_cost": float(np.sum(traj.failure_costs)),
+                    "failure_events": traj.failure_events,
+                    "task_cost": task_cost,
+                    "acc_task_reward": -task_cost,
+                    "energy_cost": energy_cost,
+                    "acc_energy_cost": energy_cost,
+                    "switch_cost": switch_cost,
+                    "nonsmooth_switch_cost": nonsmooth_switch_cost,
+                    "acc_switch_cost": switch_cost + nonsmooth_switch_cost,
+                    "failure_cost": failure_cost,
+                    "acc_failure_cost": failure_cost,
+                    "mean_abs_action": traj.mean_abs_action,
+                    "frac_zero_action": traj.frac_zero_action,
+                    "action_changes": traj.action_changes,
                     "final_belief_mean": traj.belief_means[-1],
                     "final_belief_var": traj.belief_vars[-1],
                 }

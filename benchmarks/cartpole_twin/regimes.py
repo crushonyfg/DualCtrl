@@ -27,7 +27,20 @@ class CartPoleRegimeConfig:
     multimodal_values: tuple[float, ...] = (0.65, 1.0, 1.25)
 
 
+def _effective_change_points(change_points: tuple[int, ...], horizon: int, n_values: int) -> tuple[int, ...]:
+    cps = tuple(sorted({int(cp) for cp in change_points if 0 < int(cp) < horizon}))
+    needed = max(n_values - 1, 0)
+    if len(cps) >= needed:
+        return cps[:needed]
+    if needed == 0:
+        return ()
+    fallback = tuple(max(1, min(horizon - 1, int(round(horizon * k / n_values)))) for k in range(1, n_values))
+    return tuple(sorted({*cps, *fallback}))[:needed]
+
+
 def generate_theta_path(config: CartPoleRegimeConfig, rng: np.random.Generator) -> np.ndarray:
+    if config.horizon <= 0:
+        raise ValueError("horizon must be positive")
     theta = np.empty(config.horizon, dtype=float)
     if config.kind == "static":
         theta.fill(config.base)
@@ -39,8 +52,9 @@ def generate_theta_path(config: CartPoleRegimeConfig, rng: np.random.Generator) 
             theta[t + 1] = np.clip(proposal, config.lower, config.upper)
         return theta
     if config.kind == "fixed_jumps":
+        change_points = _effective_change_points(config.change_points, config.horizon, len(config.fixed_values))
         for t in range(config.horizon):
-            idx = sum(t >= cp for cp in config.change_points)
+            idx = sum(t >= cp for cp in change_points)
             theta[t] = config.fixed_values[min(idx, len(config.fixed_values) - 1)]
         return theta
     values = np.array(config.multimodal_values if config.kind == "multimodal" else config.fixed_values, dtype=float)

@@ -6,6 +6,8 @@ import numpy as np
 
 from benchmarks.cartpole_twin.costs import CartPoleCost, CartPoleCostConfig
 from benchmarks.cartpole_twin.dynamics import CartPoleParams
+from benchmarks.cartpole_twin.env import CartPoleEnvConfig, CartPolePhysicalEnv
+from benchmarks.cartpole_twin.rollout import apply_initial_calibration, generate_initial_calibration_dataset
 from benchmarks.scalar_dual.filters import GaussianBelief
 from controllers import official
 from controllers.kh_gp import (
@@ -15,7 +17,7 @@ from controllers.kh_gp import (
     construct_kh_gp_posterior_blocks,
     kh_ad_trace_uncertainty_cost,
 )
-from controllers.official import KHDualControlCartPole, OfficialCartPoleConfig
+from controllers.official import ArcariDualSMPCCartPole, KHDualControlCartPole, OfficialCartPoleConfig, TVGPLCBCartPole
 
 
 def _controller(num_features: int = 12, horizon: int = 2, action_grid_size: int = 3) -> KHGPControllerCartPole:
@@ -193,6 +195,21 @@ def test_augmented_riccati_dimensions_for_cartpole_z_x_w() -> None:
         assert b_tilde.shape == (zdim, 1)
 
 
+def test_kh_cartpole_continuous_action_can_be_non_grid_and_bounded() -> None:
+    controller = KHGPControllerCartPole(
+        CartPoleParams(),
+        CartPoleCost(CartPoleCostConfig()),
+        KHGPConfig(horizon=1, action_grid_size=3, continuous_actions=True, optimizer_xatol=1e-6, num_features=8, seed=17),
+    )
+    controller.approximate_dual_cost = lambda state, prev_action, root_action, t0=0: (float(root_action) - 0.37) ** 2  # type: ignore[method-assign]
+
+    action = controller.act(np.zeros(4, dtype=float), 0.0)
+
+    assert -1.0 <= action <= 1.0
+    assert action not in {float(u) for u in controller.config.action_grid}
+    assert abs(action - 0.37) < 1e-3
+
+
 def test_cartpole_kh_uses_gp_transition_delta_not_actuator_gain_pseudo_observation() -> None:
     controller = KHDualControlCartPole(
         GaussianBelief(mean=1.0, var=0.1),
@@ -217,3 +234,44 @@ def test_kh_and_arcari_cartpole_do_not_share_pseudo_observation_path() -> None:
     arcari_source = inspect.getsource(official.ArcariDualSMPCCartPole)
     assert "_cartpole_theta_pseudo_observation" not in kh_source
     assert "_cartpole_theta_pseudo_observation" in arcari_source
+
+
+def test_initial_calibration_feeds_same_number_of_observations_to_cartpole_baselines() -> None:
+    cost = CartPoleCost(CartPoleCostConfig())
+    dynamics = CartPoleParams()
+    config = OfficialCartPoleConfig(horizon=2, action_grid_size=3, smpc_dual_horizon=1, smpc_scenarios=1)
+    kh_config = KHGPConfig(horizon=2, action_grid_size=3, num_features=8, seed=5)
+    theta_path = np.ones(4, dtype=float)
+    process_noise = np.zeros((4, 4), dtype=float)
+    env = CartPolePhysicalEnv(CartPoleEnvConfig(), dynamics, cost, theta_path, process_noise)
+    dataset = generate_initial_calibration_dataset(env, "grid_probe", 3, np.random.default_rng(11))
+    controllers = [
+        KHGPControllerCartPole(dynamics, cost, kh_config),
+        ArcariDualSMPCCartPole(GaussianBelief(mean=1.0, var=0.1), dynamics, cost, config),
+        TVGPLCBCartPole(dynamics, cost, config),
+    ]
+
+    counts = [apply_initial_calibration(controller, dataset) for controller in controllers]
+
+    assert counts == [3, 3, 3]
+    assert controllers[0].t == 0
+    assert controllers[1].t == 0
+    assert len(controllers[2].adapter.posterior.observations) == 3
+
+
+def test_initial_calibration_changes_kh_gp_posterior() -> None:
+    cost = CartPoleCost(CartPoleCostConfig())
+    dynamics = CartPoleParams()
+    controller = KHGPControllerCartPole(dynamics, cost, KHGPConfig(horizon=2, action_grid_size=3, num_features=8, seed=7))
+    theta_path = np.full(3, 1.2, dtype=float)
+    process_noise = np.zeros((3, 4), dtype=float)
+    env = CartPolePhysicalEnv(CartPoleEnvConfig(), dynamics, cost, theta_path, process_noise)
+    dataset = generate_initial_calibration_dataset(env, "grid_probe", 2, np.random.default_rng(13))
+    mean_before = controller.model.mean.copy()
+    cov_trace_before = np.trace(controller.model.flat_cov())
+
+    count = apply_initial_calibration(controller, dataset)
+
+    assert count == 2
+    assert not np.allclose(controller.model.mean, mean_before)
+    assert np.trace(controller.model.flat_cov()) < cov_trace_before

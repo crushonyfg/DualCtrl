@@ -54,6 +54,10 @@ def main() -> None:
     parser.add_argument("--planning-horizon", type=int, default=3)
     parser.add_argument("--scalar-action-grid-size", type=int, default=11)
     parser.add_argument("--cartpole-action-grid-size", type=int, default=5)
+    parser.add_argument("--continuous-actions", action="store_true")
+    parser.add_argument("--optimizer-grid-size", type=int, default=81)
+    parser.add_argument("--optimizer-maxiter", type=int, default=100)
+    parser.add_argument("--optimizer-xatol", type=float, default=1e-4)
     args = parser.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -64,6 +68,9 @@ def main() -> None:
             "python", "-m", "experiments.run_official_scalar",
             "--horizon", str(args.horizon), "--n-seeds", str(args.n_seeds),
             "--planning-horizon", str(args.planning_horizon), "--action-grid-size", str(args.scalar_action_grid_size),
+            *( ["--continuous-actions"] if args.continuous_actions else [] ),
+            "--optimizer-grid-size", str(args.optimizer_grid_size), "--optimizer-maxiter", str(args.optimizer_maxiter),
+            "--optimizer-xatol", str(args.optimizer_xatol),
             "--observation-interval", str(interval), "--out-dir", str(sub),
         ])
         sparse_rows.extend(collect_summary(sub / "scalar_main_summary.csv", "sparse_physical", f"m={interval}"))
@@ -77,6 +84,9 @@ def main() -> None:
             "--horizon", str(args.horizon), "--n-seeds", str(args.n_seeds),
             "--planning-horizon", str(args.planning_horizon), "--action-grid-size", str(args.scalar_action_grid_size),
             "--nonsmooth-switch-cost", str(k), "--nonsmooth-switch-threshold", "0.05",
+            *( ["--continuous-actions"] if args.continuous_actions else [] ),
+            "--optimizer-grid-size", str(args.optimizer_grid_size), "--optimizer-maxiter", str(args.optimizer_maxiter),
+            "--optimizer-xatol", str(args.optimizer_xatol),
             "--out-dir", str(sub),
         ])
         nondiff_rows.extend(collect_summary(sub / "scalar_main_summary.csv", "nondiff_switch", f"k={k}"))

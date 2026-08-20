@@ -108,20 +108,34 @@ def run(args: argparse.Namespace) -> list[dict[str, float | str | int]]:
             obs_var = args.process_std * args.process_std + args.observation_std * args.observation_std
             traj = run_scalar_rollout(env, controller, cost, args.observation_interval, obs_var)
             seed_costs[controller.name] = traj.total_cost
+            state_cost = float(np.sum(traj.state_costs))
+            energy_cost = float(np.sum(traj.energy_costs))
+            switch_cost = float(np.sum(traj.switch_costs))
+            nonsmooth_switch_cost = float(np.sum(traj.nonsmooth_switch_costs))
             out_rows.append(
                 {
                     "seed": seed,
                     "controller": controller.name,
                     "regime": args.regime,
                     "total_cost": traj.total_cost,
+                    "net_reward": -traj.total_cost,
                     "terminal_cost": traj.terminal_cost,
                     "physical_transitions": traj.physical_transitions,
                     "observed_transitions": traj.observed_transitions,
                     "observation_interval": args.observation_interval,
-                    "state_cost": float(np.sum(traj.state_costs)),
-                    "energy_cost": float(np.sum(traj.energy_costs)),
-                    "switch_cost": float(np.sum(traj.switch_costs)),
-                    "nonsmooth_switch_cost": float(np.sum(traj.nonsmooth_switch_costs)),
+                    "state_cost": state_cost,
+                    "task_cost": state_cost,
+                    "acc_task_reward": -state_cost,
+                    "energy_cost": energy_cost,
+                    "acc_energy_cost": energy_cost,
+                    "switch_cost": switch_cost,
+                    "nonsmooth_switch_cost": nonsmooth_switch_cost,
+                    "acc_switch_cost": switch_cost + nonsmooth_switch_cost,
+                    "failure_cost": 0.0,
+                    "acc_failure_cost": 0.0,
+                    "mean_abs_action": traj.mean_abs_action,
+                    "frac_zero_action": traj.frac_zero_action,
+                    "action_changes": traj.action_changes,
                     "final_belief_mean": traj.belief_means[-1],
                     "final_belief_var": traj.belief_vars[-1],
                 }

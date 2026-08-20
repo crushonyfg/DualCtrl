@@ -42,9 +42,14 @@ def main() -> None:
     parser.add_argument("--scalar-action-grid-size", type=int, default=15)
     parser.add_argument("--cartpole-action-grid-size", type=int, default=5)
     parser.add_argument("--planning-horizon", type=int, default=3)
+    parser.add_argument("--continuous-actions", action="store_true")
+    parser.add_argument("--optimizer-grid-size", type=int, default=81)
+    parser.add_argument("--optimizer-maxiter", type=int, default=100)
+    parser.add_argument("--optimizer-xatol", type=float, default=1e-4)
     parser.add_argument("--smpc-dual-horizon", type=int, default=2)
     parser.add_argument("--smpc-scenarios", type=int, default=3)
     parser.add_argument("--include-stress", action="store_true")
+    parser.add_argument("--include-diagnostics", action="store_true")
     args = parser.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -53,12 +58,17 @@ def main() -> None:
         "--n-seeds", str(args.n_seeds),
         "--planning-horizon", str(args.planning_horizon),
         "--smpc-dual-horizon", str(args.smpc_dual_horizon),
+        "--optimizer-grid-size", str(args.optimizer_grid_size),
+        "--optimizer-maxiter", str(args.optimizer_maxiter),
+        "--optimizer-xatol", str(args.optimizer_xatol),
         "--smpc-scenarios", str(args.smpc_scenarios),
         "--out-dir", str(args.out_dir),
     ]
+    diagnostic_args = ["--include-diagnostics"] if args.include_diagnostics else []
+    continuous_args = ["--continuous-actions"] if args.continuous_actions else []
     subprocess.run(["python", "-m", "experiments.reproduce_kh_section6", "--out", str(args.out_dir / "kh_section6_curve.csv")], check=True)
-    subprocess.run(["python", "-m", "experiments.run_official_scalar", "--action-grid-size", str(args.scalar_action_grid_size), *common], check=True)
-    subprocess.run(["python", "-m", "experiments.run_official_cartpole", "--action-grid-size", str(args.cartpole_action_grid_size), *common], check=True)
+    subprocess.run(["python", "-m", "experiments.run_official_scalar", "--action-grid-size", str(args.scalar_action_grid_size), *diagnostic_args, *continuous_args, *common], check=True)
+    subprocess.run(["python", "-m", "experiments.run_official_cartpole", "--action-grid-size", str(args.cartpole_action_grid_size), *diagnostic_args, *continuous_args, *common], check=True)
 
     if args.include_stress:
         subprocess.run([
@@ -69,6 +79,10 @@ def main() -> None:
             "--planning-horizon", str(args.planning_horizon),
             "--scalar-action-grid-size", str(args.scalar_action_grid_size),
             "--cartpole-action-grid-size", str(args.cartpole_action_grid_size),
+            *continuous_args,
+            "--optimizer-grid-size", str(args.optimizer_grid_size),
+            "--optimizer-maxiter", str(args.optimizer_maxiter),
+            "--optimizer-xatol", str(args.optimizer_xatol),
         ], check=True)
 
     scalar = read_csv(args.out_dir / "scalar_main_summary.csv")
@@ -90,6 +104,10 @@ def main() -> None:
         "- TV-GP-LCB is the Bogunovic time-varying GP-UCB acquisition adapted to cost minimization via LCB.",
         "- KH reproduction curve is written to kh_section6_curve.csv.",
     ]
+    if args.include_diagnostics:
+        report.extend([
+            "- Diagnostics, excluded from the main tables, are written to scalar_diagnostic_summary.csv and cartpole_diagnostic_summary.csv.",
+        ])
     if args.include_stress:
         report.extend([
             "",
