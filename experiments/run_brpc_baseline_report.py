@@ -19,7 +19,14 @@ import numpy as np
 
 from brpc_baselines.bocpd_brpc import BOCPDBRPC, BOCPDConfig
 from brpc_baselines.brpc import BRPCConfig, FixedSupportBRPC
-from brpc_baselines.planners import CEPlanner, CEMConfig, PosteriorSamplingPlanner
+from brpc_baselines.planners import (
+    CEPlanner,
+    CEMConfig,
+    PosteriorSamplingPlanner,
+    ToyCurrentDynamicsOraclePlanner,
+    ToyFutureRegimeOraclePlanner,
+    stage_reward,
+)
 from brpc_baselines.toy_envs import (
     Toy1Config,
     Toy1DigitalTwin,
@@ -34,6 +41,8 @@ BASELINES: tuple[tuple[str, str, str], ...] = (
     ("ps_brpc", "BRPC", "PS"),
     ("ce_bbrpc", "BOCPD-BRPC", "CE"),
     ("ps_bbrpc", "BOCPD-BRPC", "PS"),
+    ("oracle_current", "true_current_dynamics", "CEM-MPC oracle"),
+    ("oracle_future", "future_regime_path_appendix_ceiling", "CEM-MPC oracle"),
 )
 
 
@@ -225,35 +234,34 @@ def _initialize_calibrator(environment: str, baseline: str, runner_cfg: RunnerCo
     return brpc
 
 
-def _reward_fn(environment: str, env_cfg: Toy1Config | Toy2Config):
+def _is_oracle_baseline(baseline: str) -> bool:
+    return baseline.startswith("oracle_")
+
+
+def _stage_reward_fn(environment: str, env_cfg: Toy1Config | Toy2Config):
     if environment == "Toy1":
         cfg = env_cfg
         assert isinstance(cfg, Toy1Config)
 
-        def reward(state: np.ndarray, action: np.ndarray, previous_action: np.ndarray, t: int) -> float:
-            x = float(np.asarray(state).reshape(-1)[0])
+        def reward(predicted_response: np.ndarray, action: np.ndarray, previous_action: np.ndarray) -> float:
+            x_next = float(np.asarray(predicted_response).reshape(-1)[0])
             a = float(np.asarray(action).reshape(-1)[0])
             prev = float(np.asarray(previous_action).reshape(-1)[0])
-            ref = 0.0 if t < int(cfg.quiet_fraction * cfg.horizon_T) else cfg.production_ref
-            return -cfg.q_x * (x - ref) ** 2 - cfg.lambda_energy * a * a - cfg.lambda_switch * (a - prev) ** 2
+            ref = cfg.production_ref
+            return -cfg.q_x * (x_next - ref) ** 2 - cfg.lambda_energy * a * a - cfg.lambda_switch * (a - prev) ** 2
 
         return reward
 
     cfg = env_cfg
     assert isinstance(cfg, Toy2Config)
 
-    def reward(state: np.ndarray, action: np.ndarray, previous_action: np.ndarray, t: int) -> float:
-        del state, t
-        a = float(np.asarray(action).reshape(-1)[0])
-        prev = float(np.asarray(previous_action).reshape(-1)[0])
-        # Lightweight planner objective: action costs only.  The raw CSV records the
-        # realized physical response as task_reward; the report flags this caveat.
-        return -cfg.lambda_energy * a * a - cfg.lambda_switch * (a - prev) ** 2
+    def reward(predicted_response: np.ndarray, action: np.ndarray, previous_action: np.ndarray) -> float:
+        return stage_reward(predicted_response, action, previous_action, cfg.lambda_energy, cfg.lambda_switch)
 
     return reward
 
 
-def _make_planner(environment: str, baseline: str, env_cfg: Toy1Config | Toy2Config, runner_cfg: RunnerConfig, seed: int, calibrator):
+def _make_planner(environment: str, baseline: str, env_cfg: Toy1Config | Toy2Config, runner_cfg: RunnerConfig, seed: int, calibrator, env=None):
     if environment == "Toy1":
         low, high = env_cfg.action_low, env_cfg.action_high
         twin = Toy1DigitalTwin()
@@ -270,13 +278,39 @@ def _make_planner(environment: str, baseline: str, env_cfg: Toy1Config | Toy2Con
         action_high=high,
         random_seed=3_000 + 97 * seed + len(baseline),
     )
-    reward = _reward_fn(environment, env_cfg)
+    if baseline == "oracle_current":
+        if env is None:
+            raise ValueError("oracle_current requires the physical toy env")
+        return ToyCurrentDynamicsOraclePlanner(env, cem, environment=environment)
+    if baseline == "oracle_future":
+        if env is None:
+            raise ValueError("oracle_future requires the physical toy env")
+        return ToyFutureRegimeOraclePlanner(env, cem, environment=environment)
+    reward = _stage_reward_fn(environment, env_cfg)
     if baseline.startswith("ce"):
         return CEPlanner(reward, cem)
     # The PS planner needs the base BRPC geometry.  For BOCPD-BRPC, use the anchor
     # expert's BRPC support/kernel; sample_latent still comes from the expert mixture.
     base_brpc = calibrator.experts[0].brpc if hasattr(calibrator, "experts") else calibrator
     return PosteriorSamplingPlanner(twin, base_brpc.inducing_points, base_brpc.kernel, reward, cem)
+
+
+def _oracle_noise_free_one_step_reward(environment: str, env: Toy1PhysicalEnv | Toy2PhysicalEnv, state: np.ndarray, action: np.ndarray, previous_action: np.ndarray) -> float:
+    if environment == "Toy1":
+        theta = float(env.theta_path[env.t])
+        beta = float(env.beta_path[env.t])
+        next_state = env.twin.step(state, action, theta)
+        next_state = np.array([float(next_state[0]) + env.discrepancy(state, action, beta)], dtype=float)
+        a = float(np.asarray(action).reshape(-1)[0])
+        prev = float(np.asarray(previous_action).reshape(-1)[0])
+        return float(
+            -env.config.q_x * (float(next_state[0]) - env.config.production_ref) ** 2
+            - env.config.lambda_energy * a * a
+            - env.config.lambda_switch * (a - prev) ** 2
+        )
+    theta = float(env.theta_path[env.t])
+    response = env.expected_response(action, theta)
+    return stage_reward(np.array([response]), action, previous_action, env.config.lambda_energy, env.config.lambda_switch)
 
 
 def _diagnostic_scalars(diagnostics: dict[str, Any]) -> dict[str, Any]:
@@ -301,8 +335,8 @@ def run_one(environment: str, baseline: str, calibration: str, planner_name: str
     else:
         raise ValueError(environment)
 
-    calibrator = _initialize_calibrator(environment, baseline, runner_cfg, seed)
-    planner = _make_planner(environment, baseline, env_cfg, runner_cfg, seed, calibrator)
+    calibrator = None if _is_oracle_baseline(baseline) else _initialize_calibrator(environment, baseline, runner_cfg, seed)
+    planner = _make_planner(environment, baseline, env_cfg, runner_cfg, seed, calibrator, env=env)
     state = env.reset()
     previous_action = env.previous_action.copy()
     rows: list[dict[str, Any]] = []
@@ -318,9 +352,13 @@ def run_one(environment: str, baseline: str, calibration: str, planner_name: str
 
     for t in range(runner_cfg.horizon):
         action = planner.act(state, previous_action, calibrator, t=t)
+        predicted_reward = _oracle_noise_free_one_step_reward(environment, env, state, action, previous_action) if _is_oracle_baseline(baseline) else float("nan")
         next_state, reward, done, info = env.step(action)
-        calibrator.update(info["calibration_input"][None, :], info["calibration_output"][None, :])
-        diagnostics = _diagnostic_scalars(calibrator.diagnostics())
+        if calibrator is not None:
+            calibrator.update(info["calibration_input"][None, :], info["calibration_output"][None, :])
+            diagnostics = _diagnostic_scalars(calibrator.diagnostics())
+        else:
+            diagnostics = {"oracle_kind": getattr(planner, "oracle_kind", baseline)}
         restart_count += int(bool(diagnostics.get("restart_event", False)))
         step_queries = int(planner.query_count - previous_queries)
         previous_queries = int(planner.query_count)
@@ -344,6 +382,8 @@ def run_one(environment: str, baseline: str, calibration: str, planner_name: str
             "next_state": float(np.asarray(next_state).reshape(-1)[0]),
             "calibration_output": float(np.asarray(info["calibration_output"]).reshape(-1)[0]),
             "true_theta": float(info["theta"]),
+            "predicted_reward": float(predicted_reward),
+            "realized_reward": float(reward.net_reward),
             "task_reward": float(reward.task_reward),
             "energy_cost": float(reward.energy_cost),
             "switching_cost": float(reward.switching_cost),
@@ -465,7 +505,7 @@ def write_report(out_dir: Path, runner_cfg: RunnerConfig, summary_rows: list[dic
         "",
         "BRPC 使用固定 inducing/support set、参数粒子、particle-specific discrepancy mean 与 shared discrepancy covariance。参数权重通过 discrepancy-free likelihood 做 tempered update，discrepancy 使用 fixed-support GP 条件更新，并在 ESS 低时把参数粒子与 discrepancy mean 一起 resample。",
         "",
-        "BOCPD-BRPC 在 BRPC expert mixture 上做 prequential evidence、hazard restart 分支、expert mass 归一化与 pruning。CE planner 使用 posterior predictive mean；PS planner 每个 physical step 采样一个 latent model 后规划。",
+        "BOCPD-BRPC 在 BRPC expert mixture 上做 prequential evidence、hazard restart 分支、expert mass 归一化与 pruning。CE planner 使用 posterior predictive mean；PS planner 每个 physical step 采样一个 latent model 后规划。Toy2 planner 的 stage objective 使用同一个 physical accounting：predicted response 减 energy cost 与 previous-action switching cost。",
         "",
         "## 结果摘要",
         "",
@@ -482,7 +522,7 @@ def write_report(out_dir: Path, runner_cfg: RunnerConfig, summary_rows: list[dic
         "",
         "- 该运行 horizon、seed 数、粒子数和 CEM budget 都很小，只能作为 smoke/small check。",
         "- 未实现 oracle，因此不报告 oracle regret。",
-        "- Toy2 当前 planner 的 stage objective 为轻量 action-cost 近似；raw CSV 中的 realized task_reward 仍来自真实 physical response。该近似用于保持 smoke runner 简洁，不能据此声称某个 planner 在 Toy2 上更优。",
+        "- Toy2 geometry/reporting 区分 production operating optimum（不含 switching）和 previous-action-dependent one-step net reward；二者不应混用。",
         "- 未做 geometry plots、bootstrap CI、hazard sensitivity 或正式 paired statistical protocol。",
         "- 所有结论应限于：代码路径可运行、CSV 记账完整、BRPC-only 输出与旧 baseline 输出分离。",
         "",

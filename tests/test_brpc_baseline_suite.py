@@ -11,8 +11,17 @@ if str(ROOT) not in sys.path:
 import brpc_baselines.brpc as brpc_module
 from brpc_baselines.bocpd_brpc import BOCPDBRPC, BOCPDConfig
 from brpc_baselines.brpc import BRPCConfig, FixedSupportBRPC
-from brpc_baselines.geometry import generate_geometry_csv, toy2_diagnostic_conditions, toy2_geometry_rows
-from brpc_baselines.planners import CEPlanner, CEMConfig, PosteriorSamplingPlanner
+from brpc_baselines.geometry import (
+    generate_geometry_csv,
+    screen_toy2,
+    toy2_diagnostic_conditions,
+    toy2_geometry_rows,
+    toy2_information,
+    toy2_operating_reward,
+    toy2_one_step_net_reward,
+)
+from brpc_baselines.planners import CEPlanner, CEMConfig, PosteriorSamplingPlanner, ToyCurrentDynamicsOraclePlanner, stage_reward
+from experiments.run_brpc_cem_convergence_sweep import main as cem_convergence_main
 from brpc_baselines.smoke_runner import BASELINE_MATRIX, run_matrix
 from brpc_baselines.toy_envs import Toy1Config, Toy1DigitalTwin, Toy1PhysicalEnv, Toy2Config, Toy2DigitalTwin, Toy2PhysicalEnv
 
@@ -82,13 +91,69 @@ def test_toy2_diagnostic_action_conditions_pass_geometry_gate():
     assert conditions.passes
 
 
-def test_toy2_geometry_rows_include_required_screening_outputs():
+def test_toy2_diagnostic_not_production_optimal_but_highest_information_and_kl():
+    cfg = Toy2Config()
+    twin = Toy2DigitalTwin(cfg)
+    grid = np.linspace(cfg.action_low, cfg.action_high, 5001)
+    diag_idx = int(np.argmin(np.abs(grid - cfg.a_diag)))
+
+    for theta in np.linspace(0.0, 1.0, 21):
+        operating = toy2_operating_reward(twin, grid, float(theta))
+        assert abs(float(grid[int(np.argmax(operating))]) - cfg.a_diag) > 0.05
+        assert float(np.max(operating) - operating[diag_idx]) > 0.05
+
+    info = toy2_information(twin, grid)
+    old_mean = twin.response(grid, cfg.theta_initial)
+    new_mean = twin.response(grid, cfg.theta_after_jump)
+    kl = 0.5 * (new_mean - old_mean) ** 2 / (cfg.sigma_y**2)
+
+    assert abs(float(grid[int(np.argmax(info))]) - cfg.a_diag) < 0.01
+    assert abs(float(grid[int(np.argmax(kl))]) - cfg.a_diag) < 0.01
+    assert info[diag_idx] > max(
+        info[int(np.argmin(np.abs(grid - cfg.a_left)))],
+        info[int(np.argmin(np.abs(grid - cfg.a_right)))],
+    )
+
+
+def test_toy2_production_optima_use_operating_reward_not_one_step_net_reward():
+    cfg = Toy2Config()
+    twin = Toy2DigitalTwin(cfg)
+    grid = np.linspace(cfg.action_low, cfg.action_high, 5001)
+
+    old_operating = toy2_operating_reward(twin, grid, cfg.theta_initial)
+    new_operating = toy2_operating_reward(twin, grid, cfg.theta_after_jump)
+    old_prod = float(grid[int(np.argmax(old_operating))])
+    new_prod = float(grid[int(np.argmax(new_operating))])
+
+    assert abs(old_prod - cfg.a_left) < 0.02
+    assert abs(new_prod - cfg.a_right) < 0.02
+
+    # One-step net reward is previous-action dependent even when the production
+    # argmax remains near the same basin under the default switching coefficient.
+    new_one_step = toy2_one_step_net_reward(twin, grid, cfg.theta_after_jump, previous_action=cfg.action_low)
+    new_one_step_argmax = float(grid[int(np.argmax(new_one_step))])
+    assert abs(new_one_step_argmax - new_prod) > 0.05
+
+    report = screen_toy2(twin, cfg, num_grid=1001, previous_action=cfg.action_low)
+    assert abs(report.old_production_opt_action - cfg.a_left) < 0.025
+    assert abs(report.new_production_opt_action - cfg.a_right) < 0.025
+    assert abs(report.new_one_step_opt_action - report.new_production_opt_action) > 0.05
+
+
     cfg = Toy2Config()
     rows = toy2_geometry_rows(cfg, num_state=3, num_action=5)
     assert len(rows) == 15
     required = {
-        "expected_reward_old",
-        "expected_reward_new",
+        "operating_reward_old",
+        "operating_reward_new",
+        "one_step_net_reward_old",
+        "one_step_net_reward_new",
+        "old_production_opt_action",
+        "new_production_opt_action",
+        "diagnostic_action_configured",
+        "old_production_margin_vs_diag",
+        "new_production_margin_vs_diag",
+        "diagnostic_information",
         "parameter_sensitivity",
         "fisher_proxy",
         "variance_reduction_proxy",
@@ -106,7 +171,8 @@ def test_generate_geometry_screening_csv_cli_backend(tmp_path):
     out = tmp_path / "toy2_geometry.csv"
     generate_geometry_csv("toy2", out, num_state=2, num_action=3)
     text = out.read_text()
-    assert "expected_reward_old" in text
+    assert "operating_reward_old" in text
+    assert "one_step_net_reward_old" in text
     assert "fisher_proxy" in text
     assert "predictive_kl_old_new" in text
     assert len(text.strip().splitlines()) == 1 + 2 * 3
@@ -357,10 +423,10 @@ class RecordingTwin:
         self.inputs = []
 
     def batch_step(self, inputs, theta):
-        del theta
         X = np.atleast_2d(np.asarray(inputs, dtype=float))
-        self.inputs.extend(X.copy())
-        return (10.0 * X[:, 0] + X[:, 1])[:, None]
+        theta_value = float(np.asarray(theta, dtype=float).reshape(-1)[0])
+        self.inputs.extend(np.column_stack([X.copy(), np.full(X.shape[0], theta_value)]))
+        return (10.0 * X[:, 0] + X[:, 1] + theta_value)[:, None]
 
 
 class FixedLatentCalibrator:
@@ -374,6 +440,14 @@ class FixedLatentCalibrator:
         del rng
         self.sample_calls += 1
         return {"particle_index": 0, "theta": self.theta.copy(), "u": self.u.copy()}
+
+    def sample_latent_path(self, horizon, rng=None):
+        del rng
+        self.sample_calls += 1
+        return [
+            {"particle_index": k, "theta": self.theta.copy(), "u": self.u.copy()}
+            for k in range(int(horizon))
+        ]
 
     def predictive_mean(self, inputs):
         self.predictive_mean_calls += 1
@@ -390,7 +464,7 @@ def test_ps_discrepancy_sample_is_coherent_over_rollout():
         twin=twin,
         inducing_points=inducing,
         kernel_fn=lambda x, xp: np.ones((np.atleast_2d(x).shape[0], np.atleast_2d(xp).shape[0])),
-        reward_fn=lambda state, action, previous_action, t: float(state[0]),
+        stage_reward_fn=lambda predicted_response, action, previous_action: float(np.asarray(predicted_response).reshape(-1)[0]),
         config=CEMConfig(
             horizon=3,
             population=1,
@@ -408,7 +482,99 @@ def test_ps_discrepancy_sample_is_coherent_over_rollout():
     assert calibrator.sample_calls == 1
     assert calibrator.predictive_mean_calls == 0
     rolled_out_states = np.asarray(twin.inputs)[:, 0]
-    assert np.allclose(rolled_out_states, [1.0, 10.25, 102.75])
+    assert np.allclose(rolled_out_states, [1.0, 10.55, 106.05])
+
+
+def test_brpc_latent_path_propagates_particle_and_discrepancy_over_horizon():
+    brpc = FixedSupportBRPC(
+        RecordingTwin(),
+        np.array([[0.0, -1.0], [0.0, 1.0]]),
+        BRPCConfig(
+            theta_low=0.0,
+            theta_high=2.0,
+            num_particles=1,
+            rho_theta=0.5,
+            rho_delta=0.5,
+            theta_process_std=0.0,
+            kernel_output_scale=0.0,
+            covariance_inflation=0.0,
+            random_seed=3,
+        ),
+    )
+    brpc.state.theta_particles[:] = np.array([[2.0]])
+    brpc.state.theta_weights[:] = 1.0
+    brpc.state.discrepancy_means[:] = np.array([[[4.0, 4.0]]])
+    brpc.state.discrepancy_covariances[:] = 0.0
+    brpc.state.kzz[:] = 0.0
+
+    path = brpc.sample_latent_path(3, np.random.default_rng(9))
+
+    assert [sample["particle_index"] for sample in path] == [0, 0, 0]
+    assert np.allclose([sample["theta"][0] for sample in path], [1.5, 1.25, 1.125])
+    assert np.allclose([sample["u"][0, 0] for sample in path], [2.0, 1.0, 0.5])
+    assert np.allclose(brpc.state.theta_particles[:, 0], [2.0])
+    assert np.allclose(brpc.state.discrepancy_means[0, 0], [4.0, 4.0])
+
+
+
+def test_ps_samples_coherent_parameter_and_discrepancy_path_over_rollout():
+    class PathCalibrator:
+        def __init__(self):
+            self.sample_path_calls = 0
+            self.predictive_mean_calls = 0
+
+        def sample_latent_path(self, horizon, rng=None):
+            del rng
+            self.sample_path_calls += 1
+            assert horizon == 3
+            return [
+                {"particle_index": 0, "theta": np.array([0.0]), "u": np.array([[0.0, 0.0]])},
+                {"particle_index": 0, "theta": np.array([1.0]), "u": np.array([[0.5, 0.5]])},
+                {"particle_index": 0, "theta": np.array([2.0]), "u": np.array([[1.0, 1.0]])},
+            ]
+
+        def predictive_mean(self, inputs):
+            del inputs
+            self.predictive_mean_calls += 1
+            raise AssertionError("PS planner must not use predictive_mean")
+
+    twin = RecordingTwin()
+    calibrator = PathCalibrator()
+    planner = PosteriorSamplingPlanner(
+        twin=twin,
+        inducing_points=np.array([[0.0, -1.0], [0.0, 1.0]]),
+        kernel_fn=lambda x, xp: np.ones((np.atleast_2d(x).shape[0], np.atleast_2d(xp).shape[0])),
+        stage_reward_fn=lambda predicted_response, action, previous_action: float(np.asarray(predicted_response).reshape(-1)[0]),
+        config=CEMConfig(
+            horizon=3,
+            population=1,
+            elite_fraction=1.0,
+            iterations=1,
+            smoothing=0.0,
+            action_low=0.0,
+            action_high=0.0,
+            random_seed=1,
+        ),
+    )
+
+    planner.act(np.array([1.0]), np.array([0.0]), calibrator, t=0)
+
+    recorded = np.asarray(twin.inputs)
+    assert calibrator.sample_path_calls == 1
+    assert calibrator.predictive_mean_calls == 0
+    assert np.allclose(recorded[:, 0], [1.0, 10.0, 101.5])
+    assert np.allclose(recorded[:, -1], [0.0, 1.0, 2.0])
+
+
+def test_shared_stage_reward_matches_toy2_physical_accounting():
+    cfg = Toy2Config(horizon_T=1, change_time=1, sigma_y=0.0)
+    env = Toy2PhysicalEnv(cfg, noise_path=np.zeros(cfg.horizon_T))
+    env.reset()
+    action = np.array([cfg.a_diag])
+    predicted_response = np.array([env.expected_response(action, cfg.theta_initial)])
+    shared = stage_reward(predicted_response, action, np.array([cfg.a_left]), cfg.lambda_energy, cfg.lambda_switch)
+    _, physical_reward, _, _ = env.step(action)
+    assert np.isclose(shared, physical_reward.net_reward)
 
 
 def test_ce_and_ps_planners_use_only_their_allowed_information():
@@ -436,7 +602,7 @@ def test_ce_and_ps_planners_use_only_their_allowed_information():
             raise AssertionError("PS planner must not use certainty-equivalent mean")
 
     cem_cfg = CEMConfig(horizon=2, population=2, elite_fraction=0.5, iterations=1, action_low=0.0, action_high=0.0, random_seed=2)
-    reward = lambda state, action, previous_action, t: 0.0
+    reward = lambda predicted_response, action, previous_action: 0.0
     ce_calibrator = StrictCECalibrator()
     ce = CEPlanner(reward, cem_cfg)
     ce.act(np.array([0.1]), np.array([0.0]), ce_calibrator, t=0)
@@ -452,6 +618,88 @@ def test_ce_and_ps_planners_use_only_their_allowed_information():
     )
     ps.act(np.array([0.1]), np.array([0.0]), ps_calibrator, t=0)
     assert ps_calibrator.sample_calls == 1
+
+
+def test_current_dynamics_oracle_uses_true_current_toy2_model_without_future_change():
+    cfg = Toy2Config(horizon_T=4, change_time=1, sigma_y=0.0, lambda_switch=0.0)
+    theta_path = np.array([cfg.theta_initial, cfg.theta_after_jump, cfg.theta_after_jump, cfg.theta_after_jump])
+    env = Toy2PhysicalEnv(cfg, theta_path=theta_path, noise_path=np.zeros(cfg.horizon_T))
+    state = env.reset()
+    planner = ToyCurrentDynamicsOraclePlanner(
+        env,
+        CEMConfig(
+            horizon=1,
+            population=400,
+            elite_fraction=0.1,
+            iterations=4,
+            action_low=cfg.action_low,
+            action_high=cfg.action_high,
+            random_seed=123,
+        ),
+        environment="Toy2",
+    )
+
+    action = planner.act(state, env.previous_action, t=0)
+    grid = np.linspace(cfg.action_low, cfg.action_high, 5001)
+    current_values = np.array([
+        env.expected_response(np.array([a]), cfg.theta_initial) - cfg.lambda_energy * a * a
+        for a in grid
+    ])
+    future_values = np.array([
+        env.expected_response(np.array([a]), cfg.theta_after_jump) - cfg.lambda_energy * a * a
+        for a in grid
+    ])
+    current_opt = float(grid[int(np.argmax(current_values))])
+    future_opt = float(grid[int(np.argmax(future_values))])
+
+    assert abs(float(action[0]) - current_opt) < 0.03
+    assert abs(float(action[0]) - future_opt) > 0.10
+    assert planner.query_count == planner.config.horizon * planner.config.population * planner.config.iterations
+
+
+def test_brpc_cem_convergence_sweep_writes_expected_schema(tmp_path, monkeypatch):
+    out_dir = tmp_path / "cem_sweep"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_brpc_cem_convergence_sweep.py",
+            "--out-dir",
+            str(out_dir),
+            "--environment",
+            "Toy2",
+            "--baselines",
+            "oracle_current",
+            "--horizon",
+            "2",
+            "--seeds",
+            "0",
+            "--populations",
+            "2",
+            "--iterations",
+            "1",
+        ],
+    )
+    cem_convergence_main()
+
+    raw = (out_dir / "brpc_cem_convergence_raw.csv").read_text().splitlines()
+    header = raw[0].split(",")
+    required = {
+        "environment",
+        "baseline",
+        "cem_population",
+        "cem_iterations",
+        "selected_action",
+        "action",
+        "predicted_reward",
+        "realized_reward",
+        "planner_queries_step",
+        "query_budget",
+    }
+    assert required <= set(header)
+    assert len(raw) == 1 + 2
+    summary_header = (out_dir / "brpc_cem_convergence_summary.csv").read_text().splitlines()[0].split(",")
+    assert {"total_realized_reward", "planner_queries_total", "mean_planner_queries_step"} <= set(summary_header)
 
 
 def test_smoke_runner_executes_2x2_matrix():

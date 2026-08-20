@@ -23,14 +23,22 @@ from .toy_envs import Toy1Config, Toy1DigitalTwin, Toy2Config, Toy2DigitalTwin
 @dataclass(frozen=True)
 class GeometryReport:
     action_grid: np.ndarray
-    reward_old: np.ndarray
-    reward_new: np.ndarray
+    operating_reward_old: np.ndarray
+    operating_reward_new: np.ndarray
+    one_step_net_reward_old: np.ndarray
+    one_step_net_reward_new: np.ndarray
     sensitivity: np.ndarray
     predictive_kl_old_new: np.ndarray
     switching_cost_from_previous: np.ndarray
-    old_opt_action: float
-    new_opt_action: float
+    old_production_opt_action: float
+    new_production_opt_action: float
+    old_one_step_opt_action: float
+    new_one_step_opt_action: float
     diagnostic_action: float
+    old_production_margin_vs_diag: float
+    new_production_margin_vs_diag: float
+    diagnostic_information: float
+    diagnostic_kl: float
     passes_g1: bool
     passes_g2: bool
     passes_g3: bool
@@ -82,6 +90,32 @@ def toy2_information(twin: Toy2DigitalTwin, action: np.ndarray, noise_variance: 
     return toy2_parameter_derivative(twin, action) ** 2 / max(float(variance), 1e-12)
 
 
+def toy2_operating_reward(twin: Toy2DigitalTwin, action: np.ndarray, theta: float) -> np.ndarray:
+    """Toy 2 production/operating reward r_op(a; theta).
+
+    This excludes pairwise switching cost by definition, so production optima are not
+    conflated with one-step net reward from a particular previous action.
+    """
+
+    cfg = twin.config
+    a = np.asarray(action, dtype=float)
+    return np.asarray(twin.response(a, theta) + _toy2_discrepancy(cfg, a) - cfg.lambda_energy * a * a, dtype=float)
+
+
+def toy2_one_step_net_reward(
+    twin: Toy2DigitalTwin,
+    action: np.ndarray,
+    theta: float,
+    previous_action: np.ndarray | float,
+) -> np.ndarray:
+    """Toy 2 one-step net reward from a specified previous action."""
+
+    cfg = twin.config
+    a = np.asarray(action, dtype=float)
+    prev = np.asarray(previous_action, dtype=float)
+    return toy2_operating_reward(twin, a, theta) - cfg.lambda_switch * (a - prev) ** 2
+
+
 def toy2_expected_net_reward(
     twin: Toy2DigitalTwin,
     action: np.ndarray,
@@ -89,13 +123,15 @@ def toy2_expected_net_reward(
     previous_action: np.ndarray | float,
     include_switching: bool = True,
 ) -> np.ndarray:
-    cfg = twin.config
-    a = np.asarray(action, dtype=float)
-    prev = np.asarray(previous_action, dtype=float)
-    reward = twin.response(a, theta) + _toy2_discrepancy(cfg, a) - cfg.lambda_energy * a * a
+    """Backward-compatible Toy 2 reward helper.
+
+    Prefer toy2_operating_reward for production argmax and toy2_one_step_net_reward
+    for previous-action-dependent realized single-step accounting.
+    """
+
     if include_switching:
-        reward = reward - cfg.lambda_switch * (a - prev) ** 2
-    return np.asarray(reward, dtype=float)
+        return toy2_one_step_net_reward(twin, action, theta, previous_action)
+    return toy2_operating_reward(twin, action, theta)
 
 
 def toy2_diagnostic_conditions(
@@ -121,22 +157,8 @@ def toy2_diagnostic_conditions(
 
     diag_reward_gaps = []
     for theta in theta_grid:
-        rewards = toy2_expected_net_reward(
-            twin,
-            action_grid,
-            float(theta),
-            previous_action=config.a_left,
-            include_switching=False,
-        )
-        diag_reward = float(
-            toy2_expected_net_reward(
-                twin,
-                np.array([config.a_diag]),
-                float(theta),
-                previous_action=config.a_left,
-                include_switching=False,
-            )[0]
-        )
+        rewards = toy2_operating_reward(twin, action_grid, float(theta))
+        diag_reward = float(toy2_operating_reward(twin, np.array([config.a_diag]), float(theta))[0])
         diag_reward_gaps.append(float(np.max(rewards) - diag_reward))
 
     diagnostic_information = float(toy2_information(twin, np.array([config.a_diag]))[0])
@@ -175,29 +197,43 @@ def screen_toy2(
     X = np.column_stack([zero_state[:, 0], a])
     old_mean = twin.batch_step(X, theta_old)[:, 0]
     new_mean = twin.batch_step(X, theta_new)[:, 0]
-    reward_old = toy2_expected_net_reward(twin, a, theta_old, previous_action)
-    reward_new = toy2_expected_net_reward(twin, a, theta_new, previous_action)
+    operating_old = toy2_operating_reward(twin, a, theta_old)
+    operating_new = toy2_operating_reward(twin, a, theta_new)
+    one_step_old = toy2_one_step_net_reward(twin, a, theta_old, previous_action)
+    one_step_new = toy2_one_step_net_reward(twin, a, theta_new, previous_action)
     sensitivity = toy2_parameter_derivative(twin, a) ** 2
     kl = gaussian_kl_same_variance(new_mean, old_mean, config.sigma_y**2)
     switch = config.lambda_switch * (a - previous_action) ** 2
-    old_opt = float(a[int(np.argmax(reward_old))])
-    new_opt = float(a[int(np.argmax(reward_new))])
+    old_prod_opt = float(a[int(np.argmax(operating_old))])
+    new_prod_opt = float(a[int(np.argmax(operating_new))])
+    old_one_step_opt = float(a[int(np.argmax(one_step_old))])
+    new_one_step_opt = float(a[int(np.argmax(one_step_new))])
     diag = float(a[int(np.argmax(sensitivity))])
     diag_idx = int(np.argmin(np.abs(a - config.a_diag)))
     left_idx = int(np.argmin(np.abs(a - config.a_left)))
     right_idx = int(np.argmin(np.abs(a - config.a_right)))
-    prod_gap = min(float(np.max(reward_old) - reward_old[diag_idx]), float(np.max(reward_new) - reward_new[diag_idx]))
+    old_margin = float(np.max(operating_old) - operating_old[diag_idx])
+    new_margin = float(np.max(operating_new) - operating_new[diag_idx])
+    prod_gap = min(old_margin, new_margin)
     return GeometryReport(
         action_grid=a,
-        reward_old=reward_old,
-        reward_new=reward_new,
+        operating_reward_old=operating_old,
+        operating_reward_new=operating_new,
+        one_step_net_reward_old=one_step_old,
+        one_step_net_reward_new=one_step_new,
         sensitivity=sensitivity,
         predictive_kl_old_new=kl,
         switching_cost_from_previous=switch,
-        old_opt_action=old_opt,
-        new_opt_action=new_opt,
+        old_production_opt_action=old_prod_opt,
+        new_production_opt_action=new_prod_opt,
+        old_one_step_opt_action=old_one_step_opt,
+        new_one_step_opt_action=new_one_step_opt,
         diagnostic_action=diag,
-        passes_g1=abs(old_opt - new_opt) > 0.05 and reward_new[int(np.argmin(np.abs(a - old_opt)))] < np.max(reward_new),
+        old_production_margin_vs_diag=old_margin,
+        new_production_margin_vs_diag=new_margin,
+        diagnostic_information=float(toy2_information(twin, np.array([config.a_diag]))[0]),
+        diagnostic_kl=float(kl[diag_idx]),
+        passes_g1=abs(old_prod_opt - new_prod_opt) > 0.05 and operating_new[int(np.argmin(np.abs(a - old_prod_opt)))] < np.max(operating_new),
         passes_g2=kl[left_idx] < 0.25 * max(float(np.max(kl)), 1e-12),
         passes_g3=sensitivity[diag_idx] > max(sensitivity[left_idx], sensitivity[right_idx]),
         passes_g5=prod_gap > 0.0,
@@ -277,6 +313,16 @@ def toy2_geometry_rows(
     twin = Toy2DigitalTwin(config)
     previous_actions = np.linspace(config.action_low, config.action_high, num_state)
     actions = np.linspace(config.action_low, config.action_high, num_action)
+    fine_actions = np.linspace(config.action_low, config.action_high, max(2001, num_action))
+    old_operating_fine = toy2_operating_reward(twin, fine_actions, float(theta_old))
+    new_operating_fine = toy2_operating_reward(twin, fine_actions, float(theta_new))
+    old_production_opt_action = float(fine_actions[int(np.argmax(old_operating_fine))])
+    new_production_opt_action = float(fine_actions[int(np.argmax(new_operating_fine))])
+    diag_operating_old = float(toy2_operating_reward(twin, np.array([config.a_diag]), float(theta_old))[0])
+    diag_operating_new = float(toy2_operating_reward(twin, np.array([config.a_diag]), float(theta_new))[0])
+    old_production_margin_vs_diag = float(np.max(old_operating_fine) - diag_operating_old)
+    new_production_margin_vs_diag = float(np.max(new_operating_fine) - diag_operating_new)
+    diagnostic_information = float(toy2_information(twin, np.array([config.a_diag]))[0])
     rows: list[dict[str, float | str]] = []
     variance = max(config.sigma_y**2, 1e-12)
     for previous_action in previous_actions:
@@ -295,10 +341,18 @@ def toy2_geometry_rows(
                     "previous_action": float(previous_action),
                     "theta_old": float(theta_old),
                     "theta_new": float(theta_new),
+                    "old_production_opt_action": old_production_opt_action,
+                    "new_production_opt_action": new_production_opt_action,
+                    "diagnostic_action_configured": float(config.a_diag),
+                    "old_production_margin_vs_diag": old_production_margin_vs_diag,
+                    "new_production_margin_vs_diag": new_production_margin_vs_diag,
+                    "diagnostic_information": diagnostic_information,
                     "expected_response_old": old_mean + discrepancy,
                     "expected_response_new": new_mean + discrepancy,
-                    "expected_reward_old": float(old_mean + discrepancy - config.lambda_energy * action * action - switch),
-                    "expected_reward_new": float(new_mean + discrepancy - config.lambda_energy * action * action - switch),
+                    "operating_reward_old": float(old_mean + discrepancy - config.lambda_energy * action * action),
+                    "operating_reward_new": float(new_mean + discrepancy - config.lambda_energy * action * action),
+                    "one_step_net_reward_old": float(old_mean + discrepancy - config.lambda_energy * action * action - switch),
+                    "one_step_net_reward_new": float(new_mean + discrepancy - config.lambda_energy * action * action - switch),
                     "parameter_sensitivity": float(derivative * derivative),
                     "fisher_proxy": float(information),
                     "variance_reduction_proxy": float(information),

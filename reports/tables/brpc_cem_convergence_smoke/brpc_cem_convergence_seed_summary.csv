@@ -1,0 +1,13 @@
+environment,seed,baseline,calibration,planner,steps,cold_start_transitions,total_task_reward,total_energy_cost,total_switching_cost,total_failure_cost,total_net_reward,mean_net_reward_per_step,planner_queries_total,mean_planner_queries_per_step,restart_count,sweep,cem_population,cem_iterations
+Toy2,0,oracle_current,true_current_dynamics,CEM-MPC oracle,6,2,6.569747207793188,0.020260539686644978,0.0389006850299938,0.0,6.51058598307655,1.0850976638460916,384,64.0,0,cem_population_iterations,16,2
+Toy2,1,oracle_current,true_current_dynamics,CEM-MPC oracle,6,2,6.875509801855657,0.05397412237904568,0.18359142900185085,0.0,6.63794425047476,1.1063240417457934,384,64.0,0,cem_population_iterations,16,2
+Toy2,2,oracle_current,true_current_dynamics,CEM-MPC oracle,6,2,6.158264259076071,0.03413781064537761,0.4348657595413529,0.0,5.689260688889339,0.9482101148148899,384,64.0,0,cem_population_iterations,16,2
+Toy2,0,oracle_current,true_current_dynamics,CEM-MPC oracle,6,2,6.902741044766854,0.01179681165033143,0.00862620838075286,0.0,6.882318024735769,1.1470530041226281,768,128.0,0,cem_population_iterations,16,4
+Toy2,1,oracle_current,true_current_dynamics,CEM-MPC oracle,6,2,7.5399730140664944,0.079613923296947,0.17196089063496103,0.0,7.288398200134586,1.2147330333557644,768,128.0,0,cem_population_iterations,16,4
+Toy2,2,oracle_current,true_current_dynamics,CEM-MPC oracle,6,2,7.145094497504636,0.058217487924635575,0.1709509742458948,0.0,6.915926035334105,1.152654339222351,768,128.0,0,cem_population_iterations,16,4
+Toy2,0,oracle_current,true_current_dynamics,CEM-MPC oracle,6,2,6.707801872230771,0.09281366212449277,0.197967496304389,0.0,6.417020713801889,1.0695034523003148,768,128.0,0,cem_population_iterations,32,2
+Toy2,1,oracle_current,true_current_dynamics,CEM-MPC oracle,6,2,7.790973597609771,0.10940318002015315,0.3033980972354847,0.0,7.3781723203541345,1.229695386725689,768,128.0,0,cem_population_iterations,32,2
+Toy2,2,oracle_current,true_current_dynamics,CEM-MPC oracle,6,2,6.588530813953816,0.0895406121013742,0.35986927738431707,0.0,6.139120924468124,1.0231868207446875,768,128.0,0,cem_population_iterations,32,2
+Toy2,0,oracle_current,true_current_dynamics,CEM-MPC oracle,6,2,7.527699960795901,0.039094026965218465,0.25587021982914127,0.0,7.232735714001542,1.2054559523335904,1536,256.0,0,cem_population_iterations,32,4
+Toy2,1,oracle_current,true_current_dynamics,CEM-MPC oracle,6,2,7.723228216924973,0.0426052791243354,0.2911982678555403,0.0,7.389424669945097,1.2315707783241827,1536,256.0,0,cem_population_iterations,32,4
+Toy2,2,oracle_current,true_current_dynamics,CEM-MPC oracle,6,2,8.012217409186123,0.08385657900587272,0.15503825442758098,0.0,7.773322575752669,1.2955537626254447,1536,256.0,0,cem_population_iterations,32,4

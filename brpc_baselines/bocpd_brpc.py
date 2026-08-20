@@ -132,12 +132,32 @@ class BOCPDBRPC:
 
     def sample_latent(self, rng: np.random.Generator | None = None) -> dict:
         rng = np.random.default_rng() if rng is None else rng
+        expert = self._sample_expert(rng)
+        sample = expert.brpc.sample_latent(rng)
+        sample["expert_start_time"] = expert.start_time
+        return sample
+
+    def _sample_expert(self, rng: np.random.Generator) -> Expert:
         masses = np.asarray([e.mass for e in self.experts], dtype=float)
         masses = masses / np.sum(masses)
         e_idx = int(rng.choice(len(self.experts), p=masses))
-        sample = self.experts[e_idx].brpc.sample_latent(rng)
-        sample["expert_start_time"] = self.experts[e_idx].start_time
-        return sample
+        return self.experts[e_idx]
+
+    def sample_latent_path(self, horizon: int, rng: np.random.Generator | None = None) -> list[dict]:
+        """Sample a coherent fixed-expert future path for BOCPD-BRPC planning.
+
+        This planner variant samples the BOCPD expert once, then propagates and samples
+        a BRPC latent path inside that expert over the planning horizon. It deliberately
+        does not sample future BOCPD changepoints/restarts, so PS-BBRPC denotes
+        fixed-expert Thompson MPC rather than hazard-rollout Thompson MPC.
+        """
+
+        rng = np.random.default_rng() if rng is None else rng
+        expert = self._sample_expert(rng)
+        path = expert.brpc.sample_latent_path(horizon, rng)
+        for sample in path:
+            sample["expert_start_time"] = expert.start_time
+        return path
 
     def diagnostics(self) -> dict:
         masses = np.asarray([e.mass for e in self.experts], dtype=float)

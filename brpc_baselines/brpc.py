@@ -176,12 +176,13 @@ class FixedSupportBRPC:
     def _clip_theta(self, theta: np.ndarray) -> np.ndarray:
         return np.clip(theta, self.config.theta_low, self.config.theta_high)
 
-    def propagate(self, state: BRPCState | None = None) -> BRPCState:
+    def propagate(self, state: BRPCState | None = None, rng: np.random.Generator | None = None) -> BRPCState:
         src = self.state if state is None else state
+        rng = self.rng if rng is None else rng
         cfg = self.config
         mid = 0.5 * (cfg.theta_low + cfg.theta_high)
         theta = mid + cfg.rho_theta * (src.theta_particles - mid)
-        theta += self.rng.normal(0.0, cfg.theta_process_std, size=src.theta_particles.shape)
+        theta += rng.normal(0.0, cfg.theta_process_std, size=src.theta_particles.shape)
         theta = self._clip_theta(theta)
         means = cfg.rho_delta * src.discrepancy_means
         covs = []
@@ -326,13 +327,58 @@ class FixedSupportBRPC:
         finally:
             self.state = old_state
 
-    def sample_latent(self, rng: np.random.Generator | None = None) -> dict:
+    def sample_latent(self, rng: np.random.Generator | None = None, state: BRPCState | None = None) -> dict:
         rng = self.rng if rng is None else rng
-        i = int(rng.choice(len(self.state.theta_weights), p=self.state.theta_weights))
+        src = self.state if state is None else state
+        i = int(rng.choice(len(src.theta_weights), p=src.theta_weights))
         u = []
         for j in range(self.output_dim):
-            u.append(rng.multivariate_normal(self.state.discrepancy_means[i, j], self.state.discrepancy_covariances[j]))
-        return {"particle_index": i, "theta": self.state.theta_particles[i].copy(), "u": np.asarray(u)}
+            u.append(rng.multivariate_normal(src.discrepancy_means[i, j], src.discrepancy_covariances[j]))
+        return {"particle_index": i, "theta": src.theta_particles[i].copy(), "u": np.asarray(u)}
+
+    def sample_latent_path(self, horizon: int, rng: np.random.Generator | None = None) -> list[dict]:
+        """Sample a coherent future theta/discrepancy path from the BRPC dynamics.
+
+        The path first selects one posterior particle, then evolves that particle's
+        theta and inducing discrepancy values with the same transition model used by
+        BRPC filtering. The live filter state is left unchanged.
+        """
+
+        rng = self.rng if rng is None else rng
+        horizon = int(horizon)
+        if horizon <= 0:
+            return []
+        cfg = self.config
+        particle_index = int(rng.choice(len(self.state.theta_weights), p=self.state.theta_weights))
+        mid = 0.5 * (cfg.theta_low + cfg.theta_high)
+        theta = self.state.theta_particles[particle_index].copy()
+        u = []
+        for j in range(self.output_dim):
+            u.append(rng.multivariate_normal(self.state.discrepancy_means[particle_index, j], self.state.discrepancy_covariances[j]))
+        u = np.asarray(u, dtype=float)
+
+        path = []
+        for _ in range(horizon):
+            theta = mid + cfg.rho_theta * (theta - mid)
+            theta += rng.normal(0.0, cfg.theta_process_std, size=theta.shape)
+            theta = self._clip_theta(theta)
+            for j in range(self.output_dim):
+                base_kzz = self.state.kzz.copy()
+                if cfg.covariance_jitter > 0.0 and np.all(np.diag(base_kzz) >= cfg.covariance_jitter):
+                    base_kzz = base_kzz - cfg.covariance_jitter * np.eye(self.state.kzz.shape[0])
+                innovation_cov = (1.0 - cfg.rho_delta**2) * base_kzz
+                innovation_cov += cfg.covariance_inflation * np.eye(self.state.kzz.shape[0])
+                innovation_cov = self._symmetrize(innovation_cov)
+                eigvals, eigvecs = np.linalg.eigh(innovation_cov)
+                eigvals = np.maximum(eigvals, 0.0)
+                innovation_cov = self._symmetrize((eigvecs * eigvals) @ eigvecs.T)
+                if np.max(np.abs(innovation_cov)) > 0.0:
+                    innovation = rng.multivariate_normal(np.zeros(self.state.kzz.shape[0]), innovation_cov)
+                else:
+                    innovation = np.zeros(self.state.kzz.shape[0])
+                u[j] = cfg.rho_delta * u[j] + innovation
+            path.append({"particle_index": particle_index, "theta": theta.copy(), "u": u.copy()})
+        return path
 
     def diagnostics(self) -> dict:
         w = self.state.theta_weights

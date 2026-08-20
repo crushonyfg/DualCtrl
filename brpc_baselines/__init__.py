@@ -14,8 +14,9 @@ from .toy_envs import (
 )
 from .brpc import BRPCConfig, BRPCState, FixedSupportBRPC
 from .bocpd_brpc import BOCPDBRPC, BOCPDConfig
-from .geometry import generate_geometry_csv, toy2_diagnostic_conditions, toy2_geometry_rows
-from .planners import CEPlanner, CEMConfig, PosteriorSamplingPlanner
+from .calibration_validation import CalibrationValidationConfig, RESULT_SCHEMA, run_calibration_validation
+from .geometry import generate_geometry_csv, toy2_diagnostic_conditions, toy2_geometry_rows, toy2_operating_reward, toy2_one_step_net_reward
+from .planners import CEPlanner, CEMConfig, PosteriorSamplingPlanner, ToyCurrentDynamicsOraclePlanner, ToyFutureRegimeOraclePlanner, stage_reward
 
 __all__ = [
     "RewardBreakdown",
@@ -30,10 +31,18 @@ __all__ = [
     "FixedSupportBRPC",
     "BOCPDBRPC",
     "BOCPDConfig",
+    "CalibrationValidationConfig",
+    "RESULT_SCHEMA",
+    "run_calibration_validation",
     "generate_geometry_csv",
     "toy2_diagnostic_conditions",
     "toy2_geometry_rows",
+    "toy2_operating_reward",
+    "toy2_one_step_net_reward",
     "CEPlanner",
     "CEMConfig",
     "PosteriorSamplingPlanner",
+    "ToyCurrentDynamicsOraclePlanner",
+    "ToyFutureRegimeOraclePlanner",
+    "stage_reward",
 ]

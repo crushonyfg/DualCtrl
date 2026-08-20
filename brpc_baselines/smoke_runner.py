@@ -14,11 +14,11 @@ import numpy as np
 
 from .bocpd_brpc import BOCPDBRPC, BOCPDConfig
 from .brpc import BRPCConfig, FixedSupportBRPC
-from .planners import CEPlanner, CEMConfig, PosteriorSamplingPlanner
+from .planners import CEPlanner, CEMConfig, PosteriorSamplingPlanner, stage_reward
 from .toy_envs import Toy2Config, Toy2DigitalTwin, Toy2PhysicalEnv
 
 
-BASELINE_MATRIX = ("ce_brpc", "ps_brpc", "ce_bbrpc", "ps_bbrpc")
+BASELINE_MATRIX = ("ce_brpc", "ps_brpc", "ce_bbrpc", "ps_fixed_expert_bbrpc")
 
 
 @dataclass(frozen=True)
@@ -30,15 +30,9 @@ class SmokeResult:
     diagnostics: dict
 
 
-def _toy2_reward_fn(config: Toy2Config):
-    def reward(state: np.ndarray, action: np.ndarray, previous_action: np.ndarray, t: int) -> float:
-        del state, t
-        a = float(action[0])
-        prev = float(previous_action[0])
-        # CEM only needs a lightweight stage objective; response is supplied through
-        # predictive transition for model dynamics, while immediate production reward
-        # is approximated by action cost terms in this smoke runner.
-        return -(config.lambda_energy * a * a + config.lambda_switch * (a - prev) ** 2)
+def _toy2_stage_reward_fn(config: Toy2Config):
+    def reward(predicted_response: np.ndarray, action: np.ndarray, previous_action: np.ndarray) -> float:
+        return stage_reward(predicted_response, action, previous_action, config.lambda_energy, config.lambda_switch)
 
     return reward
 
@@ -70,7 +64,7 @@ def run_smoke_baseline(baseline: str, seed: int = 0, horizon: int = 8) -> SmokeR
     brpc = make_toy2_brpc(seed + 11)
     calibrator = BOCPDBRPC(brpc, BOCPDConfig(hazard=0.10, max_experts=4, min_segment_length=1)) if "bbrpc" in baseline else brpc
     cem_cfg = CEMConfig(horizon=2, population=16, iterations=2, action_low=0.0, action_high=1.0, random_seed=seed + 23)
-    reward_fn = _toy2_reward_fn(env_cfg)
+    reward_fn = _toy2_stage_reward_fn(env_cfg)
     if baseline.startswith("ce"):
         planner = CEPlanner(reward_fn, cem_cfg)
     else:
