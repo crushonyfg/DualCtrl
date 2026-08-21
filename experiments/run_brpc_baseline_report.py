@@ -22,7 +22,11 @@ from brpc_baselines.brpc import BRPCConfig, FixedSupportBRPC
 from brpc_baselines.planners import (
     CEPlanner,
     CEMConfig,
+    GridDPConfig,
     PosteriorSamplingPlanner,
+    Toy2GridDPCEPlanner,
+    Toy2GridDPOraclePlanner,
+    Toy2GridDPPSPlanner,
     ToyCurrentDynamicsOraclePlanner,
     ToyFutureRegimeOraclePlanner,
     stage_reward,
@@ -56,6 +60,10 @@ class RunnerConfig:
     cem_horizon: int = 2
     cem_population: int = 12
     cem_iterations: int = 2
+    toy2_optimizer: str = "cem"
+    toy2_grid_size: int = 201
+    toy2_changepoint_low_fraction: float = 0.5
+    toy2_changepoint_high_fraction: float = 0.5
     bocpd_hazard: float = 0.15
     bocpd_max_experts: int = 4
     bocpd_min_segment_length: int = 1
@@ -102,9 +110,16 @@ def _toy1_paths(cfg: Toy1Config, seed: int) -> tuple[np.ndarray, np.ndarray, np.
     return theta_path, beta_path, noise_path
 
 
-def _toy2_paths(cfg: Toy2Config, seed: int) -> tuple[np.ndarray, np.ndarray]:
+def _toy2_paths(cfg: Toy2Config, seed: int, runner_cfg: RunnerConfig | None = None) -> tuple[np.ndarray, np.ndarray]:
     rng = np.random.default_rng(20_000 + seed)
-    cp = cfg.change_time if cfg.change_time is not None else max(1, cfg.horizon_T // 2)
+    if runner_cfg is not None and runner_cfg.toy2_changepoint_low_fraction < runner_cfg.toy2_changepoint_high_fraction:
+        low = int(np.floor(runner_cfg.toy2_changepoint_low_fraction * cfg.horizon_T))
+        high = int(np.ceil(runner_cfg.toy2_changepoint_high_fraction * cfg.horizon_T))
+        low = max(1, min(cfg.horizon_T - 1, low))
+        high = max(low + 1, min(cfg.horizon_T, high))
+        cp = int(rng.integers(low, high))
+    else:
+        cp = cfg.change_time if cfg.change_time is not None else max(1, cfg.horizon_T // 2)
     theta_path = np.full(cfg.horizon_T, cfg.theta_initial)
     theta_path[int(cp) :] = cfg.theta_after_jump
     noise_path = rng.normal(0.0, cfg.sigma_y, cfg.horizon_T)
@@ -278,6 +293,17 @@ def _make_planner(environment: str, baseline: str, env_cfg: Toy1Config | Toy2Con
         action_high=high,
         random_seed=3_000 + 97 * seed + len(baseline),
     )
+    if environment == "Toy2" and runner_cfg.toy2_optimizer == "grid_dp" and baseline in {"oracle_current", "oracle_future"}:
+        if env is None:
+            raise ValueError(f"{baseline} requires the physical toy env")
+        grid_cfg = GridDPConfig(
+            horizon=runner_cfg.cem_horizon,
+            action_grid_size=runner_cfg.toy2_grid_size,
+            action_low=low,
+            action_high=high,
+        )
+        kind = "oracle_current" if baseline == "oracle_current" else "oracle_future_appendix_ceiling"
+        return Toy2GridDPOraclePlanner(env, grid_cfg, oracle_kind=kind)
     if baseline == "oracle_current":
         if env is None:
             raise ValueError("oracle_current requires the physical toy env")
@@ -287,6 +313,32 @@ def _make_planner(environment: str, baseline: str, env_cfg: Toy1Config | Toy2Con
             raise ValueError("oracle_future requires the physical toy env")
         return ToyFutureRegimeOraclePlanner(env, cem, environment=environment)
     reward = _stage_reward_fn(environment, env_cfg)
+    if environment == "Toy2" and runner_cfg.toy2_optimizer == "grid_dp":
+        grid_cfg = GridDPConfig(
+            horizon=runner_cfg.cem_horizon,
+            action_grid_size=runner_cfg.toy2_grid_size,
+            action_low=low,
+            action_high=high,
+        )
+        if baseline.startswith("ce"):
+            def response_fn(previous_actions: np.ndarray, actions: np.ndarray, step: int) -> np.ndarray:
+                del step
+                prev = np.asarray(previous_actions, dtype=float).reshape(-1)
+                a = np.asarray(actions, dtype=float).reshape(-1)
+                X = np.column_stack([prev, a])
+                return calibrator.predictive_mean(X).reshape(-1)
+
+            return Toy2GridDPCEPlanner(response_fn, env_cfg.lambda_energy, env_cfg.lambda_switch, grid_cfg)
+        base_brpc = calibrator.experts[0].brpc if hasattr(calibrator, "experts") else calibrator
+        return Toy2GridDPPSPlanner(
+            twin,
+            base_brpc.inducing_points,
+            base_brpc.kernel,
+            env_cfg.lambda_energy,
+            env_cfg.lambda_switch,
+            grid_cfg,
+            random_seed=3_000 + 97 * seed + len(baseline),
+        )
     if baseline.startswith("ce"):
         return CEPlanner(reward, cem)
     # The PS planner needs the base BRPC geometry.  For BOCPD-BRPC, use the anchor
@@ -330,7 +382,7 @@ def run_one(environment: str, baseline: str, calibration: str, planner_name: str
         env = Toy1PhysicalEnv(env_cfg, theta_path=theta_path, beta_path=beta_path, noise_path=noise_path)
     elif environment == "Toy2":
         env_cfg = Toy2Config(horizon_T=runner_cfg.horizon, change_time=max(1, runner_cfg.horizon // 2))
-        theta_path, noise_path = _toy2_paths(env_cfg, seed)
+        theta_path, noise_path = _toy2_paths(env_cfg, seed, runner_cfg)
         env = Toy2PhysicalEnv(env_cfg, theta_path=theta_path, noise_path=noise_path)
     else:
         raise ValueError(environment)
@@ -396,6 +448,7 @@ def run_one(environment: str, baseline: str, calibration: str, planner_name: str
             "cumulative_net_reward": totals["net_reward"],
             "planner_queries_step": step_queries,
             "planner_queries_total": int(planner.query_count),
+            "toy2_optimizer": runner_cfg.toy2_optimizer if environment == "Toy2" else "cem",
             "cold_start_transitions": runner_cfg.cold_start_transitions,
         }
         row.update(diagnostics)
@@ -421,6 +474,7 @@ def run_one(environment: str, baseline: str, calibration: str, planner_name: str
         "mean_net_reward_per_step": totals["net_reward"] / max(1, len(rows)),
         "planner_queries_total": int(planner.query_count),
         "mean_planner_queries_per_step": int(planner.query_count) / max(1, len(rows)),
+        "toy2_optimizer": runner_cfg.toy2_optimizer if environment == "Toy2" else "cem",
         "restart_count": restart_count,
     }
     return rows, seed_summary
@@ -494,7 +548,7 @@ def write_report(out_dir: Path, runner_cfg: RunnerConfig, summary_rows: list[dic
         f"- 环境：Toy1 与 Toy2。",
         f"- 矩阵：CE/PS planner × BRPC/BOCPD-BRPC calibration。",
         f"- horizon={runner_cfg.horizon}，seeds={list(runner_cfg.seeds)}，particles={runner_cfg.num_particles}，inducing points={runner_cfg.inducing_points}。",
-        f"- CEM：horizon={runner_cfg.cem_horizon}，population={runner_cfg.cem_population}，iterations={runner_cfg.cem_iterations}。",
+        f"- CEM：horizon={runner_cfg.cem_horizon}，population={runner_cfg.cem_population}，iterations={runner_cfg.cem_iterations}。Toy2 optimizer={runner_cfg.toy2_optimizer}，grid size={runner_cfg.toy2_grid_size}。",
         "- 这是 smoke/small run，用于检查接口、记账和输出格式；不用于论文级统计结论。",
         "",
         "## 数学建模摘要",
@@ -505,7 +559,7 @@ def write_report(out_dir: Path, runner_cfg: RunnerConfig, summary_rows: list[dic
         "",
         "BRPC 使用固定 inducing/support set、参数粒子、particle-specific discrepancy mean 与 shared discrepancy covariance。参数权重通过 discrepancy-free likelihood 做 tempered update，discrepancy 使用 fixed-support GP 条件更新，并在 ESS 低时把参数粒子与 discrepancy mean 一起 resample。",
         "",
-        "BOCPD-BRPC 在 BRPC expert mixture 上做 prequential evidence、hazard restart 分支、expert mass 归一化与 pruning。CE planner 使用 posterior predictive mean；PS planner 每个 physical step 采样一个 latent model 后规划。Toy2 planner 的 stage objective 使用同一个 physical accounting：predicted response 减 energy cost 与 previous-action switching cost。",
+        "BOCPD-BRPC 在 BRPC expert mixture 上做 prequential evidence、hazard restart 分支、expert mass 归一化与 pruning。CE planner 使用 posterior predictive mean；PS planner 每个 physical step 采样 coherent latent path 后规划。Toy2 planner 的 stage objective 使用同一个 physical accounting：predicted response 减 energy cost 与 previous-action switching cost；当 `toy2_optimizer=grid_dp` 时，Toy2 用 action-grid finite-horizon dynamic programming 精确求解离散化问题，排除 CEM optimizer randomness。",
         "",
         "## 结果摘要",
         "",
@@ -540,6 +594,10 @@ def main() -> None:
     parser.add_argument("--inducing-points", type=int, default=12)
     parser.add_argument("--cem-population", type=int, default=12)
     parser.add_argument("--cem-iterations", type=int, default=2)
+    parser.add_argument("--toy2-optimizer", choices=("cem", "grid_dp"), default="cem")
+    parser.add_argument("--toy2-grid-size", type=int, default=201)
+    parser.add_argument("--toy2-changepoint-low-fraction", type=float, default=0.5)
+    parser.add_argument("--toy2-changepoint-high-fraction", type=float, default=0.5)
     args = parser.parse_args()
 
     runner_cfg = RunnerConfig(
@@ -550,6 +608,10 @@ def main() -> None:
         inducing_points=args.inducing_points,
         cem_population=args.cem_population,
         cem_iterations=args.cem_iterations,
+        toy2_optimizer=args.toy2_optimizer,
+        toy2_grid_size=args.toy2_grid_size,
+        toy2_changepoint_low_fraction=args.toy2_changepoint_low_fraction,
+        toy2_changepoint_high_fraction=args.toy2_changepoint_high_fraction,
     )
 
     raw_rows: list[dict[str, Any]] = []

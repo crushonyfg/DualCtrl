@@ -1,0 +1,4 @@
+{
+  "initial_calibration_policy": "small_random",
+  "n_initial_calibration": 20
+}

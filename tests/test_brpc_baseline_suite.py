@@ -20,7 +20,7 @@ from brpc_baselines.geometry import (
     toy2_operating_reward,
     toy2_one_step_net_reward,
 )
-from brpc_baselines.planners import CEPlanner, CEMConfig, PosteriorSamplingPlanner, ToyCurrentDynamicsOraclePlanner, stage_reward
+from brpc_baselines.planners import CEPlanner, CEMConfig, GridDPConfig, PosteriorSamplingPlanner, Toy2GridDPCEPlanner, ToyCurrentDynamicsOraclePlanner, stage_reward
 from experiments.run_brpc_cem_convergence_sweep import main as cem_convergence_main
 from brpc_baselines.smoke_runner import BASELINE_MATRIX, run_matrix
 from brpc_baselines.toy_envs import Toy1Config, Toy1DigitalTwin, Toy1PhysicalEnv, Toy2Config, Toy2DigitalTwin, Toy2PhysicalEnv
@@ -176,6 +176,22 @@ def test_generate_geometry_screening_csv_cli_backend(tmp_path):
     assert "fisher_proxy" in text
     assert "predictive_kl_old_new" in text
     assert len(text.strip().splitlines()) == 1 + 2 * 3
+
+
+def test_toy2_grid_dp_ce_planner_solves_switching_tradeoff_without_cem_noise():
+    cfg = Toy2Config(lambda_energy=0.0, lambda_switch=0.8)
+    grid_cfg = GridDPConfig(horizon=3, action_grid_size=101, action_low=0.0, action_high=1.0)
+
+    def response(previous_actions, actions, step):
+        del previous_actions, step
+        a = np.asarray(actions, dtype=float)
+        return 2.0 - 20.0 * (a - cfg.a_right) ** 2
+
+    planner = Toy2GridDPCEPlanner(response, cfg.lambda_energy, cfg.lambda_switch, grid_cfg)
+    action = planner.act(np.array([cfg.a_left]), np.array([cfg.a_left]), None)
+
+    assert float(action[0]) > 0.55
+    assert planner.query_count == grid_cfg.horizon * grid_cfg.action_grid_size * grid_cfg.action_grid_size
 
 
 def test_brpc_update_shapes_weight_normalization_and_covariance_psd():

@@ -45,6 +45,14 @@ class CEMConfig:
     random_seed: int | None = None
 
 
+@dataclass(frozen=True)
+class GridDPConfig:
+    horizon: int = 10
+    action_grid_size: int = 201
+    action_low: float = 0.0
+    action_high: float = 1.0
+
+
 class CEPlanner:
     """Certainty-equivalent MPC: rolls out posterior predictive mean only."""
 
@@ -80,6 +88,144 @@ class CEPlanner:
         best = _cem_optimize(rollout, self.config, self.rng, self._last_mean)
         self._last_mean = best.copy()
         return np.array([best[0]], dtype=float)
+
+
+class Toy2GridDPCEPlanner:
+    """Exact finite-horizon grid-DP CE planner for Toy2.
+
+    Toy2's state is only the previous action, so the finite-horizon control problem on
+    an action grid can be solved by dynamic programming instead of CEM.  The model
+    oracle supplies a step-indexed predictive response function; no hypothetical
+    observations are assimilated during the DP rollout.
+    """
+
+    optimizer_kind = "grid_dp"
+
+    def __init__(
+        self,
+        response_fn: Callable[[np.ndarray, np.ndarray, int], np.ndarray],
+        lambda_energy: float,
+        lambda_switch: float,
+        config: GridDPConfig = GridDPConfig(),
+    ):
+        self.response_fn = response_fn
+        self.lambda_energy = float(lambda_energy)
+        self.lambda_switch = float(lambda_switch)
+        self.config = config
+        self.action_grid = np.linspace(config.action_low, config.action_high, config.action_grid_size, dtype=float)
+        self.query_count = 0
+
+    def act(self, state: np.ndarray, previous_action: np.ndarray, calibrator: PredictiveCalibrator | None = None, t: int = 0) -> np.ndarray:
+        del state, calibrator, t
+        action = _grid_dp_first_action(
+            previous_action=float(np.asarray(previous_action).reshape(-1)[0]),
+            action_grid=self.action_grid,
+            horizon=self.config.horizon,
+            response_fn=self.response_fn,
+            lambda_energy=self.lambda_energy,
+            lambda_switch=self.lambda_switch,
+        )
+        self.query_count += self.config.horizon * len(self.action_grid) * len(self.action_grid)
+        return np.array([action], dtype=float)
+
+
+class Toy2GridDPOraclePlanner:
+    """Exact finite-horizon grid-DP oracle for Toy2 current/future regimes."""
+
+    optimizer_kind = "grid_dp"
+
+    def __init__(
+        self,
+        env,
+        config: GridDPConfig = GridDPConfig(),
+        oracle_kind: Literal["oracle_current", "oracle_future_appendix_ceiling"] = "oracle_current",
+    ):
+        self.env = env
+        self.config = config
+        self.oracle_kind = oracle_kind
+        self.action_grid = np.linspace(config.action_low, config.action_high, config.action_grid_size, dtype=float)
+        self.query_count = 0
+
+    def act(self, state: np.ndarray, previous_action: np.ndarray, calibrator: PredictiveCalibrator | None = None, t: int | None = None) -> np.ndarray:
+        del state, calibrator
+        start_t = int(self.env.t if t is None else t)
+
+        def response(previous_actions: np.ndarray, actions: np.ndarray, step: int) -> np.ndarray:
+            del previous_actions
+            if self.oracle_kind == "oracle_current":
+                regime_t = start_t
+            else:
+                regime_t = min(start_t + step, self.env.config.horizon_T - 1)
+            theta = float(self.env.theta_path[regime_t])
+            return np.asarray([self.env.expected_response(np.array([a], dtype=float), theta) for a in actions], dtype=float)
+
+        action = _grid_dp_first_action(
+            previous_action=float(np.asarray(previous_action).reshape(-1)[0]),
+            action_grid=self.action_grid,
+            horizon=self.config.horizon,
+            response_fn=response,
+            lambda_energy=self.env.config.lambda_energy,
+            lambda_switch=self.env.config.lambda_switch,
+        )
+        self.query_count += self.config.horizon * len(self.action_grid) * len(self.action_grid)
+        return np.array([action], dtype=float)
+
+
+class Toy2GridDPPSPlanner:
+    """Exact finite-horizon grid-DP PS planner for Toy2 sampled latent paths."""
+
+    optimizer_kind = "grid_dp"
+
+    def __init__(
+        self,
+        twin,
+        inducing_points: np.ndarray,
+        kernel_fn: Callable[[np.ndarray, np.ndarray], np.ndarray],
+        lambda_energy: float,
+        lambda_switch: float,
+        config: GridDPConfig = GridDPConfig(),
+        random_seed: int | None = None,
+    ):
+        self.twin = twin
+        self.inducing_points = np.atleast_2d(inducing_points)
+        self.kernel_fn = kernel_fn
+        self.lambda_energy = float(lambda_energy)
+        self.lambda_switch = float(lambda_switch)
+        self.config = config
+        self.action_grid = np.linspace(config.action_low, config.action_high, config.action_grid_size, dtype=float)
+        self.rng = np.random.default_rng(random_seed)
+        self.query_count = 0
+
+    def act(self, state: np.ndarray, previous_action: np.ndarray, calibrator: PredictiveCalibrator, t: int = 0) -> np.ndarray:
+        del state, t
+        latent_path = calibrator.sample_latent_path(self.config.horizon, self.rng)
+        if len(latent_path) != self.config.horizon:
+            raise ValueError("sample_latent_path must return one latent sample per horizon step.")
+        kzz = self.kernel_fn(self.inducing_points, self.inducing_points)
+        kzz += 1e-6 * np.eye(kzz.shape[0])
+        path_coefficients = [np.linalg.solve(kzz, np.asarray(sample["u"], dtype=float).T).T for sample in latent_path]
+
+        def response(previous_actions: np.ndarray, actions: np.ndarray, step: int) -> np.ndarray:
+            prev = np.asarray(previous_actions, dtype=float).reshape(-1)
+            a = np.asarray(actions, dtype=float).reshape(-1)
+            X = np.column_stack([prev, a])
+            sample = latent_path[step]
+            nominal = self.twin.batch_step(X, sample["theta"]).reshape(-1)
+            kxz = self.kernel_fn(X, self.inducing_points)
+            coeff = path_coefficients[step]
+            delta = np.array([kxz @ coeff[j] for j in range(coeff.shape[0])]).reshape(-1)
+            return nominal + delta
+
+        action = _grid_dp_first_action(
+            previous_action=float(np.asarray(previous_action).reshape(-1)[0]),
+            action_grid=self.action_grid,
+            horizon=self.config.horizon,
+            response_fn=response,
+            lambda_energy=self.lambda_energy,
+            lambda_switch=self.lambda_switch,
+        )
+        self.query_count += self.config.horizon * len(self.action_grid) * len(self.action_grid)
+        return np.array([action], dtype=float)
 
 
 class PosteriorSamplingPlanner:
@@ -262,6 +408,35 @@ def _infer_toy_environment(env) -> Literal["Toy1", "Toy2"]:
     if hasattr(env, "expected_response"):
         return "Toy2"
     raise ValueError("Could not infer toy environment; pass environment='Toy1' or 'Toy2'.")
+
+
+def _grid_dp_first_action(
+    previous_action: float,
+    action_grid: np.ndarray,
+    horizon: int,
+    response_fn: Callable[[np.ndarray, np.ndarray, int], np.ndarray],
+    lambda_energy: float,
+    lambda_switch: float,
+) -> float:
+    grid = np.asarray(action_grid, dtype=float).reshape(-1)
+    prev_grid = grid[:, None]
+    next_grid = grid[None, :]
+    switch_cost = float(lambda_switch) * (next_grid - prev_grid) ** 2
+    value_next = np.zeros(len(grid), dtype=float)
+    policy_first = grid[0]
+
+    for step in range(int(horizon) - 1, -1, -1):
+        prev_for_eval = np.full_like(grid, float(previous_action)) if step == 0 else grid
+        responses = np.asarray(response_fn(prev_for_eval, grid, step), dtype=float).reshape(-1)
+        if responses.shape[0] != len(grid):
+            raise ValueError("response_fn must return one response per action-grid point.")
+        operating = responses - float(lambda_energy) * grid * grid
+        q = operating[None, :] - switch_cost + value_next[None, :]
+        if step == 0:
+            initial_q = operating - float(lambda_switch) * (grid - float(previous_action)) ** 2 + value_next
+            policy_first = float(grid[int(np.argmax(initial_q))])
+        value_next = np.max(q, axis=1)
+    return policy_first
 
 
 def _cem_optimize(

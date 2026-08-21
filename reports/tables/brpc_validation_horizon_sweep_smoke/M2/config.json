@@ -1,0 +1,33 @@
+{
+  "label": "M2",
+  "config": {
+    "horizon": 60,
+    "seeds": [
+      0,
+      1,
+      2
+    ],
+    "cold_start_transitions": 20,
+    "num_particles": 64,
+    "inducing_points": 24,
+    "cem_horizon": 2,
+    "cem_population": 64,
+    "cem_iterations": 3,
+    "toy2_optimizer": "grid_dp",
+    "toy2_grid_size": 101,
+    "toy2_changepoint_low_fraction": 0.35,
+    "toy2_changepoint_high_fraction": 0.65,
+    "bocpd_hazard": 0.02,
+    "bocpd_max_experts": 8,
+    "bocpd_min_segment_length": 3,
+    "output_note": "benchmark validation sweep; one mechanism varied at a time"
+  },
+  "baselines": [
+    "ce_brpc",
+    "ps_brpc",
+    "ce_bbrpc",
+    "ps_bbrpc",
+    "oracle_current",
+    "oracle_future"
+  ]
+}
